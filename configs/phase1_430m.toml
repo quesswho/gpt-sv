@@ -1,0 +1,55 @@
+# Phase 1 - 4x RTX 3060 12GB, DDP.
+#
+#   torchrun --nproc_per_node=4 -m gptsv.train --config configs/phase1_430m.toml
+#
+# The point of this tier is INFRASTRUCTURE CONFIDENCE, not throughput.
+# GeForce cards have no NVLink and P2P is disabled in the driver, so all-reduce
+# goes over PCIe host memory. Keep it data-parallel: tensor parallelism at this
+# interconnect is slower than a single GPU. Verify here that checkpoint save /
+# resume, determinism, and distributed Muon all behave, then move on.
+
+[model]
+vocab_size = 65536
+dim = 1280
+n_layers = 20
+n_heads = 20
+n_kv_heads = 4
+max_seq_len = 2048
+qk_norm = true
+tie_embeddings = true
+n_mtp_heads = 1
+mtp_loss_weight = 0.3
+z_loss_weight = 1e-4
+loss_chunk_size = 2048
+grad_checkpoint = true  # 430M on 12GB needs it
+
+[data]
+train_dir = "data/shards/sv/train"
+val_dir = "data/shards/sv/val"
+dtype = "uint16"
+
+[optim]
+use_muon = true
+muon_lr = 0.02
+adam_lr = 1e-3
+grad_clip = 1.0
+
+[schedule]
+warmup_steps = 500
+decay_frac = 0.2
+
+[train]
+out_dir = "out/phase1_430m"
+seq_len = 2048
+micro_batch_size = 2
+grad_accum_steps = 16   # 2*16*2048*4 GPUs = 262k tokens/step
+max_steps = 40000       # ~10B tokens
+parallel = "ddp"
+dtype = "bfloat16"
+compile = true
+eval_interval = 500
+eval_steps = 50
+log_interval = 20
+ckpt_interval = 2000
+wandb_project = "gpt-sv"
+wandb_run_name = "phase1-430m"

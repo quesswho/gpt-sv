@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# artifacts
+data/
+out/
+checkpoints/
+tokenizers/
+wandb/
+*.bin
+*.idx
+*.arrow
+*.parquet
+*.jsonl
+*.jsonl.zst
+!tests/fixtures/*
+
+.env
+.DS_Store

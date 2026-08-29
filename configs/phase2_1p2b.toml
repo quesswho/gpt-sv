@@ -1,0 +1,56 @@
+# Phase 2 - GH200 node (4x GH200 96GB), FSDP2.
+#
+#   torchrun --nproc_per_node=4 -m gptsv.train --config configs/phase2_1p2b.toml
+#
+# Beyond one node, switch to torchtitan - this loop is
+# data-parallel only and will not give you TP/PP/CP.
+#
+# GH200 is aarch64: use the NGC PyTorch container, do not expect pip wheels to
+# match what you had on x86.
+
+[model]
+vocab_size = 65536
+dim = 2048
+n_layers = 24
+n_heads = 16
+n_kv_heads = 4
+max_seq_len = 4096
+rope_theta = 500000.0   # longer context -> higher base
+qk_norm = true
+tie_embeddings = false  # at 1.2B the embedding is small enough to untie
+n_mtp_heads = 1
+mtp_loss_weight = 0.3
+z_loss_weight = 1e-4
+loss_chunk_size = 0     # 96GB, no need
+grad_checkpoint = false
+
+[data]
+train_dir = "data/shards/mix/train"
+val_dir = "data/shards/mix/val"
+dtype = "uint16"
+
+[optim]
+use_muon = true
+muon_lr = 0.01
+adam_lr = 6e-4
+grad_clip = 1.0
+
+[schedule]
+warmup_steps = 2000
+decay_frac = 0.2
+
+[train]
+out_dir = "out/phase2_1p2b"
+seq_len = 4096
+micro_batch_size = 8
+grad_accum_steps = 8    # 8*8*4096*4 GPUs = 1.05M tokens/step
+max_steps = 100000      # ~105B tokens
+parallel = "fsdp"
+dtype = "bfloat16"
+compile = true
+eval_interval = 1000
+eval_steps = 100
+log_interval = 20
+ckpt_interval = 2000
+wandb_project = "gpt-sv"
+wandb_run_name = "phase2-1p2b"

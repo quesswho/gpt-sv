@@ -1,0 +1,62 @@
+# Phase 0 - 1x RTX 3060 12GB.
+#
+# Purpose is ablation, not a deliverable model: tokenizer variants, data mixes,
+# Muon vs AdamW, MTP on/off. Compare at *fixed FLOPs*, not fixed steps.
+#
+#   gptsv-train --config configs/phase0_130m.toml
+#
+# If you OOM: set model.grad_checkpoint = true first (costs ~30% throughput),
+# then halve train.micro_batch_size and double train.grad_accum_steps.
+
+[model]
+vocab_size = 65536
+dim = 768
+n_layers = 12
+n_heads = 12
+n_kv_heads = 4          # GQA 3:1
+max_seq_len = 2048
+rope_theta = 10000.0
+qk_norm = true
+tie_embeddings = true   # at 130M the embedding is ~40% of params; tie it
+n_mtp_heads = 1
+mtp_loss_weight = 0.3
+z_loss_weight = 1e-4
+loss_chunk_size = 4096  # caps logit memory at 4096*65536 fp32 = 1.0GB
+grad_checkpoint = false
+
+[data]
+train_dir = "data/shards/sv/train"
+val_dir = "data/shards/sv/val"
+dtype = "uint16"
+
+[optim]
+use_muon = true
+muon_lr = 0.02
+muon_momentum = 0.95
+muon_weight_decay = 0.01
+adam_lr = 2e-3          # embeddings + output head; tune this first
+adam_weight_decay = 0.01
+grad_clip = 1.0
+
+[schedule]
+warmup_steps = 300
+decay_frac = 0.2
+lr_min_frac = 0.0
+
+[train]
+out_dir = "out/phase0_130m"
+seed = 1337
+seq_len = 2048
+micro_batch_size = 4
+grad_accum_steps = 16   # 131k tokens/step
+max_steps = 20000       # ~2.6B tokens
+parallel = "single"
+dtype = "bfloat16"
+compile = true
+eval_interval = 500
+eval_steps = 50
+log_interval = 20
+ckpt_interval = 2000
+keep_last_n_ckpts = 2
+wandb_project = "gpt-sv"
+wandb_run_name = "phase0-130m"

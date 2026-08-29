@@ -1,0 +1,43 @@
+# Tiny end-to-end smoke test. Runs on CPU in seconds. Not a real model.
+#   python scripts/make_debug_data.py
+#   gptsv-train --config configs/debug.toml
+
+[model]
+vocab_size = 512
+dim = 128
+n_layers = 4
+n_heads = 4
+n_kv_heads = 2
+max_seq_len = 128
+n_mtp_heads = 1
+mtp_loss_weight = 0.3
+z_loss_weight = 1e-4
+loss_chunk_size = 0
+
+[data]
+train_dir = "data/debug/train"
+val_dir = "data/debug/val"
+dtype = "uint16"
+
+[optim]
+use_muon = true
+muon_lr = 0.02
+adam_lr = 3e-3
+
+[schedule]
+warmup_steps = 5
+decay_frac = 0.2
+
+[train]
+out_dir = "out/debug"
+seq_len = 128
+micro_batch_size = 4
+grad_accum_steps = 2
+max_steps = 60
+parallel = "single"
+dtype = "float32"
+compile = false
+eval_interval = 30
+eval_steps = 3
+log_interval = 10
+ckpt_interval = 60
