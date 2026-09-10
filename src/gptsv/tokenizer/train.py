@@ -20,48 +20,15 @@ import argparse
 import json
 from pathlib import Path
 
+from ..data.sources import add_source_args, iter_texts
 from . import SPECIAL_TOKENS
-
-
-def _doc_iterator(args, limit: int):
-    from datasets import load_dataset
-
-    if args.files:
-        ext = Path(args.files[0]).suffix.lstrip(".")
-        fmt = {"jsonl": "json", "json": "json", "parquet": "parquet", "txt": "text"}.get(ext, ext)
-        ds = load_dataset(fmt, data_files=args.files, split="train", streaming=True)
-    else:
-        ds = load_dataset(args.dataset, args.config, split=args.split, streaming=True)
-
-    langs = set(args.langs) if args.langs else None
-    n = 0
-    for row in ds:
-        if langs is not None:
-            if args.lang_field is None:
-                raise SystemExit("--langs requires --lang-field (run `gptsv-data probe`)")
-            if row.get(args.lang_field) not in langs:
-                continue
-        text = row.get(args.text_field)
-        if not text:
-            continue
-        yield text
-        n += 1
-        if n >= limit:
-            return
 
 
 def main(argv: list[str] | None = None) -> int:
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
     p = argparse.ArgumentParser(prog="gptsv-tokenizer", description=__doc__)
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--dataset", help="HuggingFace dataset id")
-    src.add_argument("--files", nargs="+", help="local jsonl/parquet/txt files")
-    p.add_argument("--config", default=None)
-    p.add_argument("--split", default="train")
-    p.add_argument("--text-field", default="text")
-    p.add_argument("--lang-field", default=None)
-    p.add_argument("--langs", nargs="*", default=None)
+    add_source_args(p)
     p.add_argument("--out", required=True)
     p.add_argument("--vocab-size", type=int, default=65536)
     p.add_argument("--min-frequency", type=int, default=2)
@@ -101,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"training BPE (vocab={args.vocab_size}) over up to {args.n_docs:,} documents...")
-    tok.train_from_iterator(_doc_iterator(args, args.n_docs), trainer=trainer)
+    tok.train_from_iterator(iter_texts(args, args.n_docs), trainer=trainer)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

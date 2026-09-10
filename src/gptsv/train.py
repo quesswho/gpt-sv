@@ -134,6 +134,9 @@ def set_grad_sync(parallel_root, cfg: Config, enabled: bool):
 
 @torch.no_grad()
 def evaluate(train_module, loader, steps: int, device, autocast_ctx, info) -> dict[str, float]:
+    # The same val batches every time, so the eval curve tracks the model
+    # rather than which slice of the val set happened to be drawn.
+    loader.seek(0)
     train_module.eval()
     totals: dict[str, float] = {}
     for _ in range(steps):
@@ -205,10 +208,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"train: {train_ds}\nval:   {val_ds}")
 
     train_loader = TokenLoader(
-        train_ds, cfg.train.micro_batch_size, block_len, cfg.train.seed, info.rank
+        train_ds, cfg.train.micro_batch_size, block_len, cfg.train.seed, info.rank, info.world_size
     )
     val_loader = TokenLoader(
-        val_ds, cfg.train.micro_batch_size, block_len, cfg.train.seed + 1, info.rank
+        val_ds, cfg.train.micro_batch_size, block_len, cfg.train.seed + 1, info.rank, info.world_size
     )
 
     tokens_per_step = cfg.tokens_per_step * info.world_size
@@ -227,9 +230,18 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.train.wandb_project and info.is_master:
         import wandb
 
+        # A resumed run reuses the id stored in out_dir, so its metrics keep
+        # appending to the same wandb run instead of starting a new chart.
+        id_file = out_dir / "wandb_run_id"
+        resume_id = id_file.read_text().strip() if args.resume and id_file.exists() else None
         run = wandb.init(
-            project=cfg.train.wandb_project, name=cfg.train.wandb_run_name, config=config_to_dict(cfg)
+            project=cfg.train.wandb_project,
+            name=cfg.train.wandb_run_name,
+            config=config_to_dict(cfg),
+            id=resume_id,
+            resume="allow" if resume_id else None,
         )
+        id_file.write_text(run.id)
 
     # -- resume --------------------------------------------------------------
     start_step = 0
@@ -282,11 +294,12 @@ def main(argv: list[str] | None = None) -> int:
             steps_done = cfg.train.log_interval
             tok_per_s = tokens_per_step * steps_done / dt
             tflops = flops_per_token * tok_per_s / 1e12
+            mem_gb = torch.cuda.max_memory_allocated() / 1e9 if info.device.type == "cuda" else 0.0
             lrs = optimizer.current_lrs()
             print(
                 f"step {step + 1:>7d} | loss {loss_sum:.4f} | ce {main_ce_sum:.4f} "
                 f"| gnorm {float(grad_norm):.2f} | lr {lrs[0]:.2e} "
-                f"| {tok_per_s / 1e3:.1f}K tok/s | {tflops:.1f} TFLOP/s"
+                f"| {tok_per_s / 1e3:.1f}K tok/s | {tflops:.1f} TFLOP/s | mem {mem_gb:.1f}GB"
             )
             if run:
                 run.log(
@@ -297,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
                         "train/lr": lrs[0],
                         "perf/tokens_per_s": tok_per_s,
                         "perf/tflops": tflops,
+                        "perf/max_mem_gb": mem_gb,
                         "tokens": tokens_per_step * (step + 1),
                     },
                     step=step + 1,
