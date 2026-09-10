@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from gptsv.config import ModelConfig  # noqa: E402
 from gptsv.data.loader import ShardDataset, TokenLoader  # noqa: E402
-from gptsv.model import GPTSV  # noqa: E402
+from gptsv.model import GPTSV, KVCache  # noqa: E402
 
 
 def tiny_cfg(**kw) -> ModelConfig:
@@ -108,6 +108,22 @@ def test_grad_checkpointing_matches():
         assert torch.allclose(g1, g2, atol=1e-5)
 
 
+def test_kv_cache_matches_full_forward():
+    """Cached decoding must reproduce full-sequence logits; a cache bug only degrades samples."""
+    torch.manual_seed(0)
+    cfg = tiny_cfg()
+    m = GPTSV(cfg).eval()
+    tokens = torch.randint(0, 97, (2, 12))
+    cache = KVCache(cfg, batch_size=2, max_len=12, device="cpu", dtype=torch.float32)
+
+    with torch.no_grad():
+        full = m(tokens)
+        steps = [m(tokens[:, :5], cache), m(tokens[:, 5:8], cache)]
+        steps += [m(tokens[:, i : i + 1], cache) for i in range(8, 12)]
+
+    assert torch.allclose(full, torch.cat(steps, dim=1), atol=1e-5)
+
+
 def test_param_groups_exclude_embeddings():
     """Muon must never reach the embedding table or the output head.
 
@@ -142,10 +158,10 @@ def test_seek_reproduces_the_uninterrupted_order(shard_dir):
     becomes most of the run.
     """
     ds = ShardDataset(shard_dir)
-    uninterrupted = TokenLoader(ds, 2, 33, seed=3, rank=1)
+    uninterrupted = TokenLoader(ds, 2, 33, seed=3, rank=1, world_size=2)
     expected = [next(uninterrupted) for _ in range(10)]
 
-    resumed = TokenLoader(ds, 2, 33, seed=3, rank=1)
+    resumed = TokenLoader(ds, 2, 33, seed=3, rank=1, world_size=2)
     resumed.seek(6)
     for i in range(6, 10):
         assert torch.equal(next(resumed), expected[i])

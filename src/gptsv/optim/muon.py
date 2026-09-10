@@ -110,7 +110,12 @@ class Muon(Optimizer):
                     )
 
     @torch.no_grad()
-    def step(self):  # noqa: D102
+    def step(self, closure=None):  # noqa: D102
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
@@ -145,6 +150,8 @@ class Muon(Optimizer):
                 if wd != 0.0:
                     p.mul_(1.0 - lr * wd)
                 p.add_(ortho, alpha=-lr * scale)
+
+        return loss
 
 
 class OptimizerGroup:

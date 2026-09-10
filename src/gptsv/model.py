@@ -59,6 +59,33 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return out.type_as(x)
 
 
+class KVCache:
+    """Preallocated keys/values for incremental decoding, one slot per layer.
+
+    `pos` counts the positions already written. `GPTSV.trunk` advances it
+    after every forward, so a caller feeds the prompt once and then one token
+    at a time; RoPE offsets and causal masking both follow from `pos` alone.
+    """
+
+    def __init__(self, cfg: ModelConfig, batch_size: int, max_len: int, device, dtype):
+        if max_len > cfg.max_seq_len:
+            raise ValueError(f"max_len {max_len} exceeds max_seq_len {cfg.max_seq_len} (RoPE table)")
+        shape = (cfg.n_layers, batch_size, cfg.n_kv_heads, max_len, cfg.head_dim)
+        self.k = torch.zeros(shape, device=device, dtype=dtype)
+        self.v = torch.zeros(shape, device=device, dtype=dtype)
+        self.max_len = max_len
+        self.pos = 0
+
+    def update(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write k/v [B, Hkv, T, D] at `pos`; return everything cached for `layer` so far."""
+        end = self.pos + k.size(2)
+        if end > self.max_len:
+            raise ValueError(f"KV cache full: need {end} positions, have {self.max_len}")
+        self.k[layer, :, :, self.pos : end] = k
+        self.v[layer, :, :, self.pos : end] = v
+        return self.k[layer, :, :, :end], self.v[layer, :, :, :end]
+
+
 class Attention(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -77,7 +104,14 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps) if cfg.qk_norm else nn.Identity()
         self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps) if cfg.qk_norm else nn.Identity()
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache: KVCache | None = None,
+        layer: int = 0,
+    ) -> torch.Tensor:
         B, T, _ = x.shape
         q = self.wq(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.wk(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
@@ -86,7 +120,13 @@ class Attention(nn.Module):
         q = apply_rope(self.q_norm(q), cos, sin)
         k = apply_rope(self.k_norm(k), cos, sin)
 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=self.gqa)
+        if cache is None:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=self.gqa)
+        else:
+            pos = cache.pos
+            k, v = cache.update(layer, k, v)
+            mask = torch.ones(T, pos + T, dtype=torch.bool, device=x.device).tril(diagonal=pos)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=self.gqa)
         y = y.transpose(1, 2).reshape(B, T, self.n_heads * self.head_dim)
         return self.wo(y)
 
@@ -110,8 +150,15 @@ class Block(nn.Module):
         self.ffn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.ffn = SwiGLU(cfg)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), cos, sin)
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache: KVCache | None = None,
+        layer: int = 0,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x), cos, sin, cache, layer)
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
@@ -191,23 +238,30 @@ class GPTSV(nn.Module):
 
     # -- forward ------------------------------------------------------------
 
-    def trunk(self, idx: torch.Tensor) -> torch.Tensor:
-        """Token ids [B, T] -> final hidden states [B, T, dim] (pre-lm_head)."""
+    def trunk(self, idx: torch.Tensor, cache: KVCache | None = None) -> torch.Tensor:
+        """Token ids [B, T] -> final hidden states [B, T, dim] (pre-lm_head).
+
+        With a `cache`, `idx` continues the sequence already cached: its
+        positions start at `cache.pos`, and the cache is advanced past them.
+        """
         B, T = idx.shape
-        assert T <= self.cfg.max_seq_len, f"seq len {T} > max_seq_len {self.cfg.max_seq_len}"
-        cos, sin = self.rope_cos[:T], self.rope_sin[:T]
+        pos = cache.pos if cache is not None else 0
+        assert pos + T <= self.cfg.max_seq_len, f"position {pos + T} > max_seq_len {self.cfg.max_seq_len}"
+        cos, sin = self.rope_cos[pos : pos + T], self.rope_sin[pos : pos + T]
 
         x = self.tok_emb(idx)
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             if self.cfg.grad_checkpoint and self.training:
                 x = checkpoint(layer, x, cos, sin, use_reentrant=False)
             else:
-                x = layer(x, cos, sin)
+                x = layer(x, cos, sin, cache, i)
+        if cache is not None:
+            cache.pos += T
         return self.norm_f(x)
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor, cache: KVCache | None = None) -> torch.Tensor:
         """Inference path: token ids [B, T] -> logits [B, T, vocab]."""
-        return self.lm_head(self.trunk(idx))
+        return self.lm_head(self.trunk(idx, cache))
 
     def block_len(self) -> int:
         """Token block length the data loader must supply per sample.

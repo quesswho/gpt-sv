@@ -19,6 +19,7 @@ logging = ["wandb>=0.18"]
 
 [project.scripts]
 gptsv-train = "gptsv.train:main"
+gptsv-generate = "gptsv.generate:main"
 gptsv-data = "gptsv.data.prepare:main"
 gptsv-tokenizer = "gptsv.tokenizer.train:main"
 gptsv-fertility = "gptsv.tokenizer.fertility:main"
