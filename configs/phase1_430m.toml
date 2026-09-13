@@ -21,11 +21,15 @@ n_mtp_heads = 1
 mtp_loss_weight = 0.3
 z_loss_weight = 1e-4
 loss_chunk_size = 2048
-grad_checkpoint = true  # 430M on 12GB needs it
+# Only the 12GB cards this config was first written for need recompute. Target
+# hosts are >=24GB, where micro_batch 4 fits without it and the run is ~25%
+# cheaper for the same tokens.
+grad_checkpoint = false
 
 [data]
-train_dir = "data/shards/sv/train"
-val_dir = "data/shards/sv/val"
+# scripts/prepare_phase1_data.sh - sv64k-v2 tokenizer (sv64k + chat/reserved specials)
+train_dir = "data/shards/sv64k-v2/train"
+val_dir = "data/shards/sv64k-v2/val"
 dtype = "uint16"
 
 [optim]
@@ -50,6 +54,9 @@ compile = true
 eval_interval = 500
 eval_steps = 50
 log_interval = 20
-ckpt_interval = 2000
+# A preemptible host can vanish mid-run, and at 2000 steps a 2x3090 pair would
+# lose ~8h of work. 200 steps costs ~50 min at worst and a 4.9GB write each time.
+ckpt_interval = 200
+keep_last_n_ckpts = 3
 wandb_project = "gpt-sv"
 wandb_run_name = "phase1-430m"
