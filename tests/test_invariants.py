@@ -40,6 +40,38 @@ def tiny_cfg(**kw) -> ModelConfig:
     return ModelConfig(**base)
 
 
+def test_meta_load_matches_eager_construction(tmp_path):
+    """Loading via `meta` must produce the same model as constructing eagerly.
+
+    `load_model` skips __init__ by building on `meta`, then adopts the
+    checkpoint's tensors with assign=True. Two things can go wrong silently:
+    assign replaces the Parameter objects, so a tied lm_head quietly becomes a
+    second copy that drifts from the embedding, and the rope buffers are
+    persistent=False, so they are absent from the state dict and stay on `meta`.
+    """
+    from gptsv.generate import load_model
+
+    cfg = tiny_cfg(tie_embeddings=True)
+    torch.manual_seed(0)
+    reference = GPTSV(cfg).eval()
+    path = tmp_path / "ckpt.pt"
+    torch.save(
+        {"model": reference.state_dict(), "step": 7, "config": {"model": vars(cfg)}}, path
+    )
+
+    loaded, step = load_model(str(path), torch.device("cpu"))
+    assert step == 7
+
+    assert not any(p.is_meta for p in loaded.parameters())
+    assert not any(b.is_meta for b in loaded.buffers())
+    assert loaded.lm_head.weight is loaded.tok_emb.weight
+    assert loaded.num_params() == reference.num_params()
+
+    tokens = torch.randint(0, cfg.vocab_size, (1, cfg.max_seq_len))
+    with torch.no_grad():
+        assert torch.equal(loaded.trunk(tokens), reference.trunk(tokens))
+
+
 def test_mtp_targets_are_offset_correctly():
     """Depth k must predict token i+k+1 - one step further out than depth k-1.
 

@@ -13,17 +13,38 @@ from contextlib import nullcontext
 import torch
 
 from .config import ModelConfig
-from .model import GPTSV, KVCache
+from .model import GPTSV, KVCache, precompute_rope
 from .tokenizer import SPECIAL_TOKENS
 
 EOT = SPECIAL_TOKENS[0]
 
 
-def load_model(path: str, device: torch.device) -> tuple[GPTSV, int]:
+def load_model(
+    path: str, device: torch.device, dtype: torch.dtype | None = None
+) -> tuple[GPTSV, int]:
+    """Load a checkpoint for inference. Builds on `meta` to skip __init__'s
+    trunc_normal_ over every parameter, ~42s at 448M and overwritten anyway."""
     ckpt = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
-    model = GPTSV(ModelConfig(**ckpt["config"]["model"]))
-    model.load_state_dict(ckpt["model"])
-    return model.to(device).eval(), int(ckpt["step"])
+    cfg = ModelConfig(**ckpt["config"]["model"])
+
+    with torch.device("meta"):
+        model = GPTSV(cfg)
+    model.load_state_dict(ckpt["model"], assign=True, strict=True)
+
+    # persistent=False, so absent from the state dict and still meta after load
+    model.rope_cos, model.rope_sin = precompute_rope(
+        cfg.head_dim, cfg.max_seq_len, cfg.rope_theta
+    )
+
+    model = model.to(device)
+    if dtype is not None:
+        model = model.to(dtype)
+        # keep rope in fp32: bf16 cos/sin carries ~3 digits of a rotation angle
+        model.rope_cos = model.rope_cos.float()
+        model.rope_sin = model.rope_sin.float()
+    if cfg.tie_embeddings:  # assign=True replaced the shared Parameter
+        model.lm_head.weight = model.tok_emb.weight
+    return model.eval(), int(ckpt["step"])
 
 
 def sample(logits: torch.Tensor, temperature: float, top_k: int) -> torch.Tensor:
@@ -78,14 +99,29 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--num-samples", type=int, default=1)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--dtype",
+        default=None,
+        choices=["bfloat16", "float16", "float32"],
+        help="weight dtype on the device; defaults to bfloat16 on cuda",
+    )
     args = p.parse_args(argv)
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
     tok = Tokenizer.from_file(f"{args.tokenizer}/tokenizer.json")
     eot_id = tok.token_to_id(EOT)
-    model, step = load_model(args.ckpt, torch.device(args.device))
-    print(f"loaded step {step} ({model.num_params() / 1e6:.0f}M params) on {args.device}\n")
+    device = torch.device(args.device)
+    if args.dtype is not None:
+        dtype = getattr(torch, args.dtype)
+    else:
+        dtype = torch.bfloat16 if device.type == "cuda" else None
+    t0 = time.perf_counter()
+    model, step = load_model(args.ckpt, device, dtype)
+    print(
+        f"loaded step {step} ({model.num_params() / 1e6:.0f}M params) on {args.device}"
+        f" as {next(model.parameters()).dtype} in {time.perf_counter() - t0:.1f}s\n"
+    )
 
     prompt_ids = [eot_id] + tok.encode(args.prompt, add_special_tokens=False).ids
     if len(prompt_ids) >= model.cfg.max_seq_len:
