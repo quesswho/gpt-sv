@@ -11,18 +11,23 @@ exception, no visible loss anomaly, just days of GPU time spent on a slightly
 wrong model. That is the only reason these survived.
 """
 
+import json
+import random
 import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from gptsv.config import ModelConfig  # noqa: E402
 from gptsv.data.loader import ShardDataset, TokenLoader  # noqa: E402
 from gptsv.model import GPTSV, KVCache  # noqa: E402
+from gptsv.tokenizer import CHAT_TOKENS, SPECIAL_TOKENS  # noqa: E402
+from gptsv.tokenizer.reserve import reserve_special_tokens  # noqa: E402
 
 
 def tiny_cfg(**kw) -> ModelConfig:
@@ -197,3 +202,48 @@ def test_seek_reproduces_the_uninterrupted_order(shard_dir):
     resumed.seek(6)
     for i in range(6, 10):
         assert torch.equal(next(resumed), expected[i])
+
+
+def test_reserved_special_tokens_keep_every_other_id():
+    """Reserving special tokens must not change how ordinary text tokenizes.
+
+    `gptsv.tokenizer.reserve` swaps a tokenizer's last merges for new special
+    tokens. If it dropped the wrong merges or shifted an ID, shards and
+    checkpoints would still load - the IDs would just mean different text.
+    """
+    rng = random.Random(0)
+    words = [
+        "".join(rng.choices("abcdefghijklmnopqrstuvwxyzåäö", k=rng.randint(2, 8)))
+        for _ in range(300)
+    ]
+    texts = [" ".join(rng.choices(words, k=12)) for _ in range(500)]
+
+    tok = Tokenizer(models.BPE())
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(
+        vocab_size=400,
+        special_tokens=SPECIAL_TOKENS,
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        show_progress=False,
+    )
+    tok.train_from_iterator(texts, trainer=trainer)
+    n = tok.get_vocab_size()
+
+    new = CHAT_TOKENS + ["<|reserved_0|>"]
+    derived = Tokenizer.from_str(json.dumps(reserve_special_tokens(json.loads(tok.to_str()), new)))
+    cut = n - len(new)
+
+    assert derived.get_vocab_size() == n
+    assert [derived.token_to_id(t) for t in new] == list(range(cut, n))
+    assert derived.encode(f"{CHAT_TOKENS[0]}hej").ids[0] == cut
+
+    untouched = 0
+    for text in texts:
+        before, after = tok.encode(text).ids, derived.encode(text).ids
+        assert derived.decode(after) == text
+        if max(before) < cut:
+            assert after == before
+            untouched += 1
+    # both branches must be exercised, or the test proves nothing
+    assert 0 < untouched < len(texts)
