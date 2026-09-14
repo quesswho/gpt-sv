@@ -380,6 +380,25 @@ class GPTSV(nn.Module):
             z_mtp=None if z_mtp is None else z_mtp.detach(),
         )
 
+    @torch.no_grad()
+    def calibrate_mtp_out_norm(self, tokens: torch.Tensor) -> None:
+        """Fit each MTP out_norm gain so the normalised output matches the raw one.
+
+        For resuming a checkpoint trained without out_norm: a per-channel
+        least-squares gain keeps the head's output scale instead of resetting it
+        to unit RMS. `tokens` is a [B, block_len()] batch.
+        """
+        T = self.cfg.max_seq_len
+        cos, sin = self.rope_cos[:T], self.rope_sin[:T]
+        h_k = self.trunk(tokens[:, :T])
+        for k, head in enumerate(self.mtp_heads, start=1):
+            h_k = head(h_k, self.tok_emb(tokens[:, k : k + T]), cos, sin)
+            if head.out_norm is None:
+                continue
+            x = h_k.float().reshape(-1, h_k.size(-1))
+            n = F.rms_norm(x, (x.size(-1),), None, head.out_norm.eps)
+            head.out_norm.weight.copy_((x * n).sum(0) / (n * n).sum(0))
+
     # -- introspection ------------------------------------------------------
 
     def num_params(self, non_embedding: bool = False) -> int:

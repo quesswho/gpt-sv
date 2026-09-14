@@ -280,12 +280,23 @@ def main(argv: list[str] | None = None) -> int:
             # Keys are stored unprefixed, so restore into the raw model. Its
             # parameters are the same objects DDP shares and FSDP2 sharded
             # in place, so this reaches the parallel wrappers too.
-            start_step = load_checkpoint(path, model, optimizer, info)
+            allow_missing = (r"mtp_heads\.\d+\.out_norm\.weight",) if cfg.model.mtp_out_norm else ()
+            start_step, missing = load_checkpoint(path, model, optimizer, info, allow_missing)
             # The loader is a pure function of (seed, rank, batch index), so
             # seeking reproduces the exact data order the run would have had.
             train_loader.seek(start_step * cfg.train.grad_accum_steps)
             if info.is_master:
                 print(f"resumed from {path} at step {start_step}")
+            if missing:
+                # Needs unsharded parameters, and the same batch on every rank.
+                if cfg.train.parallel == "fsdp" and info.enabled:
+                    raise SystemExit("adding mtp out_norm on resume is not supported under FSDP")
+                calib = TokenLoader(
+                    val_ds, cfg.train.micro_batch_size, block_len, cfg.train.seed, 0, 1
+                )
+                model.calibrate_mtp_out_norm(next(calib).to(info.device))
+                if info.is_master:
+                    print(f"checkpoint predates mtp out_norm; calibrated {missing}")
 
     flops_per_token = model.flops_per_token()
     train_module.train()

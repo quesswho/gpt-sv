@@ -384,3 +384,67 @@ def test_checkpoint_saved_before_mtp_out_norm_still_loads(tmp_path):
         assert (loaded.mtp_heads[0].out_norm is not None) == out_norm
         assert not any(p.is_meta for p in loaded.parameters())
         assert loaded.num_params() == reference.num_params()
+
+
+def _trained_checkpoint(tmp_path, **cfg_kw):
+    from gptsv.config import OptimConfig
+    from gptsv.optim import build_optimizer
+    from gptsv.utils import DistInfo, save_checkpoint
+
+    torch.manual_seed(0)
+    model = GPTSV(tiny_cfg(**cfg_kw))
+    opt = build_optimizer(model, OptimConfig())
+    for _ in range(20):
+        model.loss(torch.randint(0, 97, (4, model.block_len()))).loss.backward()
+        opt.step()
+        opt.zero_grad()
+    path = tmp_path / "ckpt.pt"
+    save_checkpoint(path, model, opt, 20, {}, DistInfo())
+    return model, path
+
+
+def _fresh(**cfg_kw):
+    from gptsv.config import OptimConfig
+    from gptsv.optim import build_optimizer
+
+    model = GPTSV(tiny_cfg(**cfg_kw))
+    return model, build_optimizer(model, OptimConfig())
+
+
+def test_resume_rejects_checkpoints_that_do_not_match_the_model(tmp_path):
+    from gptsv.utils import DistInfo, load_checkpoint
+
+    _, path = _trained_checkpoint(tmp_path, n_mtp_heads=1)
+    ckpt = torch.load(path, weights_only=False)
+    del ckpt["model"]["layers.0.attn.wq.weight"]
+    torch.save(ckpt, path)
+    with pytest.raises(ValueError, match="layers.0.attn.wq.weight"):
+        load_checkpoint(path, *_fresh(n_mtp_heads=1), DistInfo())
+
+    _, path = _trained_checkpoint(tmp_path, n_mtp_heads=1, mtp_out_norm=True)
+    with pytest.raises(ValueError, match="unexpected"):
+        load_checkpoint(path, *_fresh(n_mtp_heads=1), DistInfo())
+
+
+def test_resume_adds_calibrated_mtp_out_norm(tmp_path):
+    from gptsv.utils import DistInfo, load_checkpoint
+
+    old, path = _trained_checkpoint(tmp_path, n_mtp_heads=1, loss_chunk_size=0)
+    held_out = torch.randint(0, 97, (8, old.block_len()))
+    with torch.no_grad():
+        reference = old.loss(held_out).mtp_ce
+
+    cfg = dict(n_mtp_heads=1, mtp_out_norm=True, loss_chunk_size=0)
+    with pytest.raises(ValueError, match="out_norm"):
+        load_checkpoint(path, *_fresh(**cfg), DistInfo())
+
+    new, opt = _fresh(**cfg)
+    step, missing = load_checkpoint(
+        path, new, opt, DistInfo(), (r"mtp_heads\.\d+\.out_norm\.weight",)
+    )
+    assert step == 20 and missing == ["mtp_heads.0.out_norm.weight"]
+    with torch.no_grad():
+        uncalibrated = new.loss(held_out).mtp_ce
+        new.calibrate_mtp_out_norm(torch.randint(0, 97, (8, new.block_len())))
+        calibrated = new.loss(held_out).mtp_ce
+    assert abs(calibrated - reference) < 0.1 * abs(uncalibrated - reference)

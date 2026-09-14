@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,8 +171,14 @@ def find_latest_checkpoint(out_dir: Path) -> Path | None:
     return ckpts[-1] if ckpts else None
 
 
-def load_checkpoint(path: Path, model, optimizer, info: DistInfo) -> int:
-    """Restore model + optimizer in place. Returns the step to resume from.
+def load_checkpoint(
+    path: Path, model, optimizer, info: DistInfo, allow_missing: tuple[str, ...] = ()
+) -> tuple[int, list[str]]:
+    """Restore model + optimizer in place. Returns (step, missing keys).
+
+    Every model weight must be in the checkpoint and vice versa, except missing
+    keys that fully match one of the `allow_missing` regexes; those keep their
+    initial values. set_model_state_dict does not enforce this itself.
 
     Loads the full (unsharded) state on every rank and lets
     `set_model_state_dict` re-shard it, so a checkpoint written on N GPUs can
@@ -185,7 +192,18 @@ def load_checkpoint(path: Path, model, optimizer, info: DistInfo) -> int:
     )
 
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    opts = StateDictOptions(full_state_dict=True, broadcast_from_rank0=info.enabled)
+    expected, saved = set(model.state_dict()), set(ckpt["model"])
+    missing = sorted(expected - saved)
+    unexpected = sorted(saved - expected)
+    disallowed = [k for k in missing if not any(re.fullmatch(p, k) for p in allow_missing)]
+    if disallowed or unexpected:
+        raise ValueError(
+            f"checkpoint {path} does not match the model: "
+            f"missing {disallowed}, unexpected {unexpected}"
+        )
+    opts = StateDictOptions(
+        full_state_dict=True, broadcast_from_rank0=info.enabled, strict=not missing
+    )
     set_model_state_dict(model, ckpt["model"], options=opts)
 
     # Muon and AdamW each own a disjoint subset of the parameters, so from any
@@ -196,7 +214,7 @@ def load_checkpoint(path: Path, model, optimizer, info: DistInfo) -> int:
     )
     for opt, sd in zip(optimizer.optimizers, ckpt["optimizer"], strict=True):
         set_optimizer_state_dict(model, opt, optim_state_dict=sd, options=opt_opts)
-    return int(ckpt["step"])
+    return int(ckpt["step"]), missing
 
 
 def prune_checkpoints(
