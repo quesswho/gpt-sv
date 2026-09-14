@@ -194,6 +194,8 @@ class LossOutput:
     loss: torch.Tensor  # the scalar that gets .backward()
     main_ce: torch.Tensor
     mtp_ce: torch.Tensor | None
+    z_main: torch.Tensor | None = None  # mean logsumexp^2 of the main logits
+    z_mtp: torch.Tensor | None = None  # same, meaned over MTP heads
 
 
 class GPTSV(nn.Module):
@@ -329,12 +331,12 @@ class GPTSV(nn.Module):
         h = self.trunk(idx)
 
         want_z = cfg.z_loss_weight > 0
-        main_ce, z_raw = self._head_loss(h, tokens[:, 1 : T + 1], want_z)
+        main_ce, z_main = self._head_loss(h, tokens[:, 1 : T + 1], want_z)
 
-        mtp_ce = None
+        mtp_ce = z_mtp = None
         if cfg.n_mtp_heads > 0:
             cos, sin = self.rope_cos[:T], self.rope_sin[:T]
-            losses, z_mtp = [], []
+            losses, z_heads = [], []
             h_k = h
             for k, head in enumerate(self.mtp_heads, start=1):
                 emb = self.tok_emb(tokens[:, k : k + T])
@@ -351,17 +353,19 @@ class GPTSV(nn.Module):
                 ce_k, z_k = self._head_loss(h_k, tokens[:, k + 1 : k + 1 + T], want_z)
                 losses.append(ce_k)
                 if z_k is not None:
-                    z_mtp.append(z_k)
+                    z_heads.append(z_k)
             mtp_ce = torch.stack(losses).mean()
-            if z_mtp:
+            if z_heads:
                 # Meaned over heads to mirror mtp_ce, but added at full strength
                 # rather than scaled by mtp_loss_weight: this bounds the shared
                 # output head's logit scale, it is not part of the MTP objective.
-                z_raw = z_raw + torch.stack(z_mtp).mean()
+                z_mtp = torch.stack(z_heads).mean()
 
         total = main_ce
-        if z_raw is not None:
-            total = total + cfg.z_loss_weight * z_raw
+        if z_main is not None:
+            total = total + cfg.z_loss_weight * z_main
+        if z_mtp is not None:
+            total = total + cfg.z_loss_weight * z_mtp
         if mtp_ce is not None:
             total = total + cfg.mtp_loss_weight * mtp_ce
 
@@ -369,6 +373,8 @@ class GPTSV(nn.Module):
             loss=total,
             main_ce=main_ce.detach(),
             mtp_ce=None if mtp_ce is None else mtp_ce.detach(),
+            z_main=None if z_main is None else z_main.detach(),
+            z_mtp=None if z_mtp is None else z_mtp.detach(),
         )
 
     # -- introspection ------------------------------------------------------

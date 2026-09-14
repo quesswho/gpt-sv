@@ -122,6 +122,22 @@ def wrap_parallel(model, cfg: Config, info):
     raise SystemExit(f"unknown train.parallel: {cfg.train.parallel!r}")
 
 
+def grad_norm_groups(model) -> dict[str, list[nn.Parameter]]:
+    """Parameters bucketed for per-group gradient norms. Tied weights appear once."""
+    groups: dict[str, list[nn.Parameter]] = {}
+    for name, p in model.named_parameters():
+        if name.startswith("layers."):
+            key = "trunk"
+        elif name.startswith("mtp_heads."):
+            key = "mtp"
+        elif name.startswith(("tok_emb.", "lm_head.")):
+            key = "embed"
+        else:
+            key = "other"
+        groups.setdefault(key, []).append(p)
+    return groups
+
+
 def set_grad_sync(parallel_root, cfg: Config, enabled: bool):
     """Suppress gradient sync during grad-accum micro-steps."""
     if parallel_root is None:
@@ -148,12 +164,19 @@ def evaluate(train_module, loader, steps: int, device, autocast_ctx, info) -> di
         totals["val_main_ce"] = totals.get("val_main_ce", 0.0) + out.main_ce.item()
         if out.mtp_ce is not None:
             totals["val_mtp_ce"] = totals.get("val_mtp_ce", 0.0) + out.mtp_ce.item()
+        for part, z in (("main", out.z_main), ("mtp", out.z_mtp)):
+            if z is not None:
+                totals[f"val_z_{part}"] = totals.get(f"val_z_{part}", 0.0) + z.item()
     train_module.train()
 
     metrics = {k: v / steps for k, v in totals.items()}
     for k, v in metrics.items():
         metrics[k] = all_reduce_mean(torch.tensor(v, device=device), info).item()
     metrics["val_ppl"] = math.exp(min(20.0, metrics["val_main_ce"]))
+    for part in ("main", "mtp"):
+        z = metrics.pop(f"val_z_{part}", None)
+        if z is not None:
+            metrics[f"val_lse_rms_{part}"] = math.sqrt(z)
     return metrics
 
 
@@ -268,12 +291,14 @@ def main(argv: list[str] | None = None) -> int:
     train_module.train()
     t0 = time.perf_counter()
     accum = cfg.train.grad_accum_steps
+    norm_groups = grad_norm_groups(model)
 
     for step in range(start_step, cfg.train.max_steps):
         optimizer.set_lr_mult(lr_multiplier(step, cfg.train.max_steps, cfg.schedule))
 
         loss_sum = 0.0
         main_ce_sum = 0.0
+        z_sums: dict[str, torch.Tensor] = {}
         for micro in range(accum):
             tokens = next(train_loader).to(info.device, non_blocking=True)
             ctx = set_grad_sync(parallel_root, cfg, enabled=(micro == accum - 1))
@@ -283,12 +308,24 @@ def main(argv: list[str] | None = None) -> int:
             loss.backward()
             loss_sum += loss.item()
             main_ce_sum += out.main_ce.item() / accum
+            for part, z in (("main", out.z_main), ("mtp", out.z_mtp)):
+                if z is not None:
+                    z_sums[part] = z_sums.get(part, 0.0) + z / accum
+
+        log_step = (step + 1) % cfg.train.log_interval == 0
+        group_norms: dict[str, float] = {}
+        if log_step:
+            # Pre-clip, and on every rank: under FSDP the norms are collectives.
+            for key, params in norm_groups.items():
+                grads = [p.grad for p in params if p.grad is not None]
+                if grads:
+                    group_norms[key] = float(torch.nn.utils.get_total_norm(grads))
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        if (step + 1) % cfg.train.log_interval == 0 and info.is_master:
+        if log_step and info.is_master:
             if info.device.type == "cuda":
                 torch.cuda.synchronize()
             dt = time.perf_counter() - t0
@@ -297,9 +334,12 @@ def main(argv: list[str] | None = None) -> int:
             tflops = flops_per_token * tok_per_s / 1e12
             mem_gb = torch.cuda.max_memory_allocated() / 1e9 if info.device.type == "cuda" else 0.0
             lrs = optimizer.current_lrs()
+            lse = {part: math.sqrt(float(z)) for part, z in z_sums.items()}
+            groups_str = " ".join(f"{k} {v:.2f}" for k, v in group_norms.items())
+            lse_str = " ".join(f"{k} {v:.2f}" for k, v in lse.items())
             print(
                 f"step {step + 1:>7d} | loss {loss_sum:.4f} | ce {main_ce_sum:.4f} "
-                f"| gnorm {float(grad_norm):.2f} | lr {lrs[0]:.2e} "
+                f"| gnorm {float(grad_norm):.2f} ({groups_str}) | lse ({lse_str}) | lr {lrs[0]:.2e} "
                 f"| {tok_per_s / 1e3:.1f}K tok/s | {tflops:.1f} TFLOP/s | mem {mem_gb:.1f}GB"
             )
             if run:
@@ -308,6 +348,8 @@ def main(argv: list[str] | None = None) -> int:
                         "train/loss": loss_sum,
                         "train/main_ce": main_ce_sum,
                         "train/grad_norm": float(grad_norm),
+                        **{f"grad_norm/{k}": v for k, v in group_norms.items()},
+                        **{f"train/lse_rms_{k}": v for k, v in lse.items()},
                         "train/lr": lrs[0],
                         "perf/tokens_per_s": tok_per_s,
                         "perf/tflops": tflops,

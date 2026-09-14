@@ -315,3 +315,40 @@ def test_milestone_interval_must_align_with_ckpt_interval():
         TrainConfig(ckpt_interval=200, keep_every_n_steps=4100)
     with pytest.raises(ValueError, match=">= 0"):
         TrainConfig(ckpt_interval=200, keep_every_n_steps=-1)
+
+
+def test_loss_reports_z_terms_that_sum_to_the_total():
+    torch.manual_seed(0)
+    cfg = tiny_cfg(n_mtp_heads=1, z_loss_weight=1e-2, loss_chunk_size=0)
+    model = GPTSV(cfg)
+    tokens = torch.randint(0, cfg.vocab_size, (2, model.block_len()))
+    out = model.loss(tokens)
+    expected = (
+        out.main_ce
+        + cfg.z_loss_weight * (out.z_main + out.z_mtp)
+        + cfg.mtp_loss_weight * out.mtp_ce
+    )
+    assert torch.allclose(out.loss.detach(), expected, rtol=1e-5)
+
+    assert GPTSV(tiny_cfg(z_loss_weight=1e-2)).loss(tokens[:, :-1]).z_mtp is None
+    no_z = GPTSV(tiny_cfg(n_mtp_heads=1)).loss(tokens)
+    assert no_z.z_main is None and no_z.z_mtp is None
+
+
+def test_grad_norm_groups_cover_every_parameter_once():
+    from gptsv.train import grad_norm_groups
+
+    torch.manual_seed(0)
+    model = GPTSV(tiny_cfg(n_mtp_heads=1, z_loss_weight=1e-4))
+    model.loss(torch.randint(0, 97, (2, model.block_len()))).loss.backward()
+
+    groups = grad_norm_groups(model)
+    grouped = [p for ps in groups.values() for p in ps]
+    assert len(grouped) == len({id(p) for p in grouped}) == len(list(model.parameters()))
+    assert set(groups) == {"embed", "trunk", "mtp", "other"}
+
+    total = torch.nn.utils.get_total_norm([p.grad for p in model.parameters()])
+    per_group = torch.stack(
+        [torch.nn.utils.get_total_norm([p.grad for p in ps]) for ps in groups.values()]
+    )
+    assert torch.allclose(per_group.pow(2).sum().sqrt(), total, rtol=1e-5)
