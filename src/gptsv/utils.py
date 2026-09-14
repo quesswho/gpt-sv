@@ -199,12 +199,15 @@ def load_checkpoint(path: Path, model, optimizer, info: DistInfo) -> int:
     return int(ckpt["step"])
 
 
-def prune_checkpoints(out_dir: Path, keep: int, protect: Path | None = None) -> None:
+def prune_checkpoints(
+    out_dir: Path, keep: int, protect: Path | None = None, keep_every: int = 0
+) -> None:
     """Keep the `keep` highest-numbered checkpoints.
 
     `protect` is never deleted. Without it, resuming into an out_dir that
     already holds higher-numbered checkpoints from a previous run would delete
-    the checkpoint that was just written.
+    the checkpoint that was just written. Checkpoints at a multiple of
+    `keep_every` are never deleted either.
     """
     if keep <= 0:
         return
@@ -212,6 +215,8 @@ def prune_checkpoints(out_dir: Path, keep: int, protect: Path | None = None) -> 
     protect = protect.resolve() if protect else None
     for old in ckpts[:-keep]:
         if protect is not None and old.resolve() == protect:
+            continue
+        if keep_every > 0 and int(old.stem.split("_")[1]) % keep_every == 0:
             continue
         old.unlink(missing_ok=True)
 

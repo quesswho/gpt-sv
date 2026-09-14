@@ -117,9 +117,19 @@ class TrainConfig:
     log_interval: int = 10
     ckpt_interval: int = 1000
     keep_last_n_ckpts: int = 2
+    keep_every_n_steps: int = 0  # never prune checkpoints at multiples of this; 0 disables
 
     wandb_project: str | None = None
     wandb_run_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.keep_every_n_steps < 0:
+            raise ValueError(f"keep_every_n_steps must be >= 0, got {self.keep_every_n_steps}")
+        if self.keep_every_n_steps and self.keep_every_n_steps % self.ckpt_interval:
+            raise ValueError(
+                f"keep_every_n_steps={self.keep_every_n_steps} is not a multiple of "
+                f"ckpt_interval={self.ckpt_interval}, so no checkpoint would be kept"
+            )
 
 
 @dataclass

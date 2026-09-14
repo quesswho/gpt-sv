@@ -277,3 +277,41 @@ def test_mtp_logits_are_z_regularised_like_the_main_head():
     assert not torch.allclose(off, on), (
         "z_loss_weight does not reach the MTP heads: their logits are unbounded"
     )
+
+
+def _write_ckpts(root: Path, steps: list[int]) -> None:
+    for s in steps:
+        (root / f"step_{s:07d}.pt").write_bytes(b"x")
+
+
+def _steps(root: Path) -> list[int]:
+    return sorted(int(p.stem.split("_")[1]) for p in root.glob("step_*.pt"))
+
+
+def test_pruning_never_deletes_milestones(tmp_path):
+    from gptsv.utils import prune_checkpoints
+
+    steps = list(range(200, 10001, 200))
+    for s in steps:  # prune after every save, exactly as train.py does
+        _write_ckpts(tmp_path, [s])
+        prune_checkpoints(tmp_path, 3, protect=tmp_path / f"step_{s:07d}.pt", keep_every=4000)
+    assert _steps(tmp_path) == [4000, 8000, 9600, 9800, 10000]
+
+
+def test_pruning_without_milestones_is_unchanged(tmp_path):
+    from gptsv.utils import prune_checkpoints
+
+    _write_ckpts(tmp_path, [4000, 4200, 4400, 4600])
+    prune_checkpoints(tmp_path, 2)
+    assert _steps(tmp_path) == [4400, 4600]
+
+
+def test_milestone_interval_must_align_with_ckpt_interval():
+    from gptsv.config import TrainConfig
+
+    TrainConfig(ckpt_interval=200, keep_every_n_steps=4000)
+    TrainConfig(ckpt_interval=200, keep_every_n_steps=0)
+    with pytest.raises(ValueError, match="not a multiple"):
+        TrainConfig(ckpt_interval=200, keep_every_n_steps=4100)
+    with pytest.raises(ValueError, match=">= 0"):
+        TrainConfig(ckpt_interval=200, keep_every_n_steps=-1)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import shutil
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -339,8 +340,20 @@ def main(argv: list[str] | None = None) -> int:
                 info,
             )
             if info.is_master:
-                prune_checkpoints(out_dir, cfg.train.keep_last_n_ckpts, protect=ckpt_path)
+                prune_checkpoints(
+                    out_dir,
+                    cfg.train.keep_last_n_ckpts,
+                    protect=ckpt_path,
+                    keep_every=cfg.train.keep_every_n_steps,
+                )
                 print(f"step {step + 1:>7d} | checkpoint saved")
+                # Milestones accumulate; warn before a save can hit a full disk.
+                free, size = shutil.disk_usage(out_dir).free, ckpt_path.stat().st_size
+                if free < 2 * size:
+                    print(
+                        f"step {step + 1:>7d} | WARNING: {free / 1e9:.1f} GB free in {out_dir}, "
+                        f"checkpoints are {size / 1e9:.2f} GB"
+                    )
             t0 = time.perf_counter()
 
     if run:
