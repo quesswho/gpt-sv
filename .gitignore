@@ -30,3 +30,7 @@ venv/
 
 # vim leaves these behind when an open file is unlinked
 .fuse_hidden*
+
+# checkpoints: never commit, they are gigabytes each
+*.pt
+/archive/
