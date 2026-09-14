@@ -11,6 +11,7 @@ n_kv_heads = 2
 max_seq_len = 128
 n_mtp_heads = 1
 mtp_loss_weight = 0.3
+mtp_out_norm = true
 z_loss_weight = 1e-4
 loss_chunk_size = 0
 

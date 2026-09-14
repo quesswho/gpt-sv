@@ -34,6 +34,9 @@ class ModelConfig:
     # full-vocab logit matrix in the loss, so memory grows noticeably.
     n_mtp_heads: int = 0
     mtp_loss_weight: float = 0.3
+    # RMSNorm on each MTP output before the shared lm_head, as in DeepSeek-V3.
+    # Off by default so checkpoints saved without it rebuild unchanged.
+    mtp_out_norm: bool = False
 
     z_loss_weight: float = 1e-4  # stabilises logit scale; 0 disables
     init_std: float = 0.02

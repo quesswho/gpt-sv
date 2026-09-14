@@ -169,7 +169,8 @@ class MTPHead(nn.Module):
     Takes the previous depth's hidden state h at position i and the embedding of
     the token at i+k, and predicts the token at i+k+1 through the *shared*
     output head. Embedding and output head are shared with the trunk, so each
-    head costs one block + one projection.
+    head costs one block + one projection. `out_norm` normalises what reaches
+    the output head; the next depth receives the un-normalised state.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -178,6 +179,7 @@ class MTPHead(nn.Module):
         self.e_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.proj = nn.Linear(2 * cfg.dim, cfg.dim, bias=False)
         self.block = Block(cfg)
+        self.out_norm = RMSNorm(cfg.dim, cfg.norm_eps) if cfg.mtp_out_norm else None
 
     def forward(self, h, emb, cos, sin):
         z = self.proj(torch.cat((self.h_norm(h), self.e_norm(emb)), dim=-1))
@@ -350,7 +352,8 @@ class GPTSV(nn.Module):
                 # the MTP heads' 280.6, max |logit| 3420, and 87% of a grad norm
                 # of 9.5 coming from the MTP term - against a grad_clip of 1.0,
                 # which then scales the healthy LM update down with it.
-                ce_k, z_k = self._head_loss(h_k, tokens[:, k + 1 : k + 1 + T], want_z)
+                h_out = h_k if head.out_norm is None else head.out_norm(h_k)
+                ce_k, z_k = self._head_loss(h_out, tokens[:, k + 1 : k + 1 + T], want_z)
                 losses.append(ce_k)
                 if z_k is not None:
                     z_heads.append(z_k)

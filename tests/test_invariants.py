@@ -352,3 +352,35 @@ def test_grad_norm_groups_cover_every_parameter_once():
         [torch.nn.utils.get_total_norm([p.grad for p in ps]) for ps in groups.values()]
     )
     assert torch.allclose(per_group.pow(2).sum().sqrt(), total, rtol=1e-5)
+
+
+@pytest.mark.parametrize("out_norm", [True, False])
+def test_mtp_out_norm_makes_mtp_loss_scale_invariant(out_norm):
+    torch.manual_seed(0)
+    model = GPTSV(tiny_cfg(n_mtp_heads=1, mtp_out_norm=out_norm, loss_chunk_size=0))
+    tokens = torch.randint(0, 97, (2, model.block_len()))
+    with torch.no_grad():
+        base = model.loss(tokens).mtp_ce
+        handle = model.mtp_heads[0].block.register_forward_hook(lambda m, i, o: o * 50)
+        scaled = model.loss(tokens).mtp_ce
+        handle.remove()
+    assert torch.allclose(base, scaled, rtol=1e-4) == out_norm
+
+
+def test_checkpoint_saved_before_mtp_out_norm_still_loads(tmp_path):
+    from gptsv.generate import load_model
+
+    for out_norm in (True, False):
+        cfg = tiny_cfg(n_mtp_heads=1, mtp_out_norm=out_norm)
+        torch.manual_seed(0)
+        reference = GPTSV(cfg).eval()
+        saved = vars(cfg).copy()
+        if not out_norm:
+            del saved["mtp_out_norm"]  # config written before the option existed
+        path = tmp_path / f"ckpt_{out_norm}.pt"
+        torch.save({"model": reference.state_dict(), "step": 1, "config": {"model": saved}}, path)
+
+        loaded, _ = load_model(str(path), torch.device("cpu"))
+        assert (loaded.mtp_heads[0].out_norm is not None) == out_norm
+        assert not any(p.is_meta for p in loaded.parameters())
+        assert loaded.num_params() == reference.num_params()

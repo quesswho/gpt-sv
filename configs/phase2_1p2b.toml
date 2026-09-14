@@ -20,6 +20,7 @@ qk_norm = true
 tie_embeddings = false  # at 1.2B the embedding is small enough to untie
 n_mtp_heads = 1
 mtp_loss_weight = 0.3
+mtp_out_norm = true
 z_loss_weight = 1e-4
 loss_chunk_size = 0     # 96GB, no need
 grad_checkpoint = false
