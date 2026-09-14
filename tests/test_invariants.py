@@ -60,9 +60,7 @@ def test_meta_load_matches_eager_construction(tmp_path):
     torch.manual_seed(0)
     reference = GPTSV(cfg).eval()
     path = tmp_path / "ckpt.pt"
-    torch.save(
-        {"model": reference.state_dict(), "step": 7, "config": {"model": vars(cfg)}}, path
-    )
+    torch.save({"model": reference.state_dict(), "step": 7, "config": {"model": vars(cfg)}}, path)
 
     loaded, step = load_model(str(path), torch.device("cpu"))
     assert step == 7
@@ -247,3 +245,35 @@ def test_reserved_special_tokens_keep_every_other_id():
             untouched += 1
     # both branches must be exercised, or the test proves nothing
     assert 0 < untouched < len(texts)
+
+
+def test_mtp_logits_are_z_regularised_like_the_main_head():
+    """Every head that writes through the tied lm_head must get the z penalty.
+
+    The MTP heads once passed want_z=False, so their logits were the only ones
+    in the model with nothing bounding their scale. Nothing failed: the logits
+    drifted up over tens of thousands of steps, and because lm_head is tied to
+    tok_emb it arrived as an ever-growing gradient on the shared embedding. In
+    phase 1 that reached main logsumexp 0.91 against the MTP heads' 280.6 and
+    87% of the total gradient norm, which grad_clip then applied to the healthy
+    LM update as well.
+
+    Detected here as: z_loss_weight must change the gradient of an MTP-only
+    parameter. Under the old behaviour it could not.
+    """
+    torch.manual_seed(0)
+    cfg_kw = dict(n_mtp_heads=1, loss_chunk_size=0)
+    tokens = torch.randint(0, 97, (2, tiny_cfg(**cfg_kw).max_seq_len + 2))
+
+    def mtp_grad(z_weight: float) -> torch.Tensor:
+        torch.manual_seed(0)
+        model = GPTSV(tiny_cfg(**cfg_kw, z_loss_weight=z_weight))
+        model.train()
+        model.zero_grad()
+        model.loss(tokens).loss.backward()
+        return model.mtp_heads[0].proj.weight.grad.clone()
+
+    off, on = mtp_grad(0.0), mtp_grad(1e-2)
+    assert not torch.allclose(off, on), (
+        "z_loss_weight does not reach the MTP heads: their logits are unbounded"
+    )

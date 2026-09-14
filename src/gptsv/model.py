@@ -330,23 +330,38 @@ class GPTSV(nn.Module):
 
         want_z = cfg.z_loss_weight > 0
         main_ce, z_raw = self._head_loss(h, tokens[:, 1 : T + 1], want_z)
-        z_loss = cfg.z_loss_weight * z_raw if z_raw is not None else None
 
         mtp_ce = None
         if cfg.n_mtp_heads > 0:
             cos, sin = self.rope_cos[:T], self.rope_sin[:T]
-            losses = []
+            losses, z_mtp = [], []
             h_k = h
             for k, head in enumerate(self.mtp_heads, start=1):
                 emb = self.tok_emb(tokens[:, k : k + T])
                 h_k = head(h_k, emb, cos, sin)
-                ce_k, _ = self._head_loss(h_k, tokens[:, k + 1 : k + 1 + T], want_z=False)
+                # want_z, not False. These logits leave through the same tied
+                # lm_head as the main ones and so need the same leash: left
+                # unregularised the MTP logits drift up without bound, and
+                # because the matrix is shared that lands as an ever-growing
+                # gradient on tok_emb rather than staying inside the head.
+                # Measured at phase 1 step 35800: main logsumexp 0.91 against
+                # the MTP heads' 280.6, max |logit| 3420, and 87% of a grad norm
+                # of 9.5 coming from the MTP term - against a grad_clip of 1.0,
+                # which then scales the healthy LM update down with it.
+                ce_k, z_k = self._head_loss(h_k, tokens[:, k + 1 : k + 1 + T], want_z)
                 losses.append(ce_k)
+                if z_k is not None:
+                    z_mtp.append(z_k)
             mtp_ce = torch.stack(losses).mean()
+            if z_mtp:
+                # Meaned over heads to mirror mtp_ce, but added at full strength
+                # rather than scaled by mtp_loss_weight: this bounds the shared
+                # output head's logit scale, it is not part of the MTP objective.
+                z_raw = z_raw + torch.stack(z_mtp).mean()
 
         total = main_ce
-        if z_loss is not None:
-            total = total + z_loss
+        if z_raw is not None:
+            total = total + cfg.z_loss_weight * z_raw
         if mtp_ce is not None:
             total = total + cfg.mtp_loss_weight * mtp_ce
 
