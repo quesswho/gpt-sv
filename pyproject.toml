@@ -23,6 +23,7 @@ gptsv-generate = "gptsv.generate:main"
 gptsv-data = "gptsv.data.prepare:main"
 gptsv-tokenizer = "gptsv.tokenizer.train:main"
 gptsv-tokenizer-reserve = "gptsv.tokenizer.reserve:main"
+gptsv-export-hf = "gptsv.hf:main"
 gptsv-fertility = "gptsv.tokenizer.fertility:main"
 
 [build-system]

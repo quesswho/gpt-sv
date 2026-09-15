@@ -34,3 +34,6 @@ venv/
 # checkpoints: never commit, they are gigabytes each
 *.pt
 /archive/
+
+# exported Hugging Face models
+/hf/

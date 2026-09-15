@@ -411,3 +411,15 @@ def test_resume_adds_calibrated_mtp_out_norm(tmp_path):
         new.calibrate_mtp_out_norm(torch.randint(0, 97, (8, new.block_len())))
         calibrated = new.loss(held_out).mtp_ce
     assert abs(calibrated - reference) < 0.1 * abs(uncalibrated - reference)
+
+
+@pytest.mark.parametrize("tie", [True, False])
+def test_hf_export_matches_gptsv_logits(tie):
+    from gptsv.hf import build_hf_model, max_logit_diff
+
+    torch.manual_seed(0)
+    cfg = tiny_cfg(tie_embeddings=tie, n_mtp_heads=1, mtp_out_norm=True)
+    model = GPTSV(cfg)
+    hf_model = build_hf_model(cfg, model.state_dict())
+    tokens = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
+    assert max_logit_diff(model, hf_model, tokens) < 1e-4
