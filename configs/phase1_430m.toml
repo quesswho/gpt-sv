@@ -20,7 +20,7 @@ tie_embeddings = true
 n_mtp_heads = 1
 mtp_loss_weight = 0.3
 mtp_out_norm = true
-z_loss_weight = 1e-4
+z_loss_weight = 0.0
 loss_chunk_size = 2048
 grad_checkpoint = false
 

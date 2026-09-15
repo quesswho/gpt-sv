@@ -164,19 +164,16 @@ def evaluate(train_module, loader, steps: int, device, autocast_ctx, info) -> di
         totals["val_main_ce"] = totals.get("val_main_ce", 0.0) + out.main_ce.item()
         if out.mtp_ce is not None:
             totals["val_mtp_ce"] = totals.get("val_mtp_ce", 0.0) + out.mtp_ce.item()
-        for part, z in (("main", out.z_main), ("mtp", out.z_mtp)):
-            if z is not None:
-                totals[f"val_z_{part}"] = totals.get(f"val_z_{part}", 0.0) + z.item()
+        if out.z_main is not None:
+            totals["val_z_main"] = totals.get("val_z_main", 0.0) + out.z_main.item()
     train_module.train()
 
     metrics = {k: v / steps for k, v in totals.items()}
     for k, v in metrics.items():
         metrics[k] = all_reduce_mean(torch.tensor(v, device=device), info).item()
     metrics["val_ppl"] = math.exp(min(20.0, metrics["val_main_ce"]))
-    for part in ("main", "mtp"):
-        z = metrics.pop(f"val_z_{part}", None)
-        if z is not None:
-            metrics[f"val_lse_rms_{part}"] = math.sqrt(z)
+    if "val_z_main" in metrics:
+        metrics["val_lse_rms_main"] = math.sqrt(metrics.pop("val_z_main"))
     return metrics
 
 
@@ -319,9 +316,8 @@ def main(argv: list[str] | None = None) -> int:
             loss.backward()
             loss_sum += loss.item()
             main_ce_sum += out.main_ce.item() / accum
-            for part, z in (("main", out.z_main), ("mtp", out.z_mtp)):
-                if z is not None:
-                    z_sums[part] = z_sums.get(part, 0.0) + z / accum
+            if out.z_main is not None:
+                z_sums["main"] = z_sums.get("main", 0.0) + out.z_main / accum
 
         log_step = (step + 1) % cfg.train.log_interval == 0
         group_norms: dict[str, float] = {}

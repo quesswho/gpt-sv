@@ -247,38 +247,6 @@ def test_reserved_special_tokens_keep_every_other_id():
     assert 0 < untouched < len(texts)
 
 
-def test_mtp_logits_are_z_regularised_like_the_main_head():
-    """Every head that writes through the tied lm_head must get the z penalty.
-
-    The MTP heads once passed want_z=False, so their logits were the only ones
-    in the model with nothing bounding their scale. Nothing failed: the logits
-    drifted up over tens of thousands of steps, and because lm_head is tied to
-    tok_emb it arrived as an ever-growing gradient on the shared embedding. In
-    phase 1 that reached main logsumexp 0.91 against the MTP heads' 280.6 and
-    87% of the total gradient norm, which grad_clip then applied to the healthy
-    LM update as well.
-
-    Detected here as: z_loss_weight must change the gradient of an MTP-only
-    parameter. Under the old behaviour it could not.
-    """
-    torch.manual_seed(0)
-    cfg_kw = dict(n_mtp_heads=1, loss_chunk_size=0)
-    tokens = torch.randint(0, 97, (2, tiny_cfg(**cfg_kw).max_seq_len + 2))
-
-    def mtp_grad(z_weight: float) -> torch.Tensor:
-        torch.manual_seed(0)
-        model = GPTSV(tiny_cfg(**cfg_kw, z_loss_weight=z_weight))
-        model.train()
-        model.zero_grad()
-        model.loss(tokens).loss.backward()
-        return model.mtp_heads[0].proj.weight.grad.clone()
-
-    off, on = mtp_grad(0.0), mtp_grad(1e-2)
-    assert not torch.allclose(off, on), (
-        "z_loss_weight does not reach the MTP heads: their logits are unbounded"
-    )
-
-
 def _write_ckpts(root: Path, steps: list[int]) -> None:
     for s in steps:
         (root / f"step_{s:07d}.pt").write_bytes(b"x")
@@ -323,16 +291,11 @@ def test_loss_reports_z_terms_that_sum_to_the_total():
     model = GPTSV(cfg)
     tokens = torch.randint(0, cfg.vocab_size, (2, model.block_len()))
     out = model.loss(tokens)
-    expected = (
-        out.main_ce
-        + cfg.z_loss_weight * (out.z_main + out.z_mtp)
-        + cfg.mtp_loss_weight * out.mtp_ce
-    )
+    expected = out.main_ce + cfg.z_loss_weight * out.z_main + cfg.mtp_loss_weight * out.mtp_ce
     assert torch.allclose(out.loss.detach(), expected, rtol=1e-5)
 
-    assert GPTSV(tiny_cfg(z_loss_weight=1e-2)).loss(tokens[:, :-1]).z_mtp is None
     no_z = GPTSV(tiny_cfg(n_mtp_heads=1)).loss(tokens)
-    assert no_z.z_main is None and no_z.z_mtp is None
+    assert no_z.z_main is None
 
 
 def test_grad_norm_groups_cover_every_parameter_once():
