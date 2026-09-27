@@ -23,7 +23,7 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("ckpt", help="training checkpoint written by gptsv-train")
-    p.add_argument("out_dir", help="destination directory (put this on an SSD)")
+    p.add_argument("out_dir", help="destination directory")
     p.add_argument(
         "--strip-optim",
         action="store_true",
@@ -36,16 +36,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = p.parse_args(argv)
 
-    # A run with neither flag would just be a slower `cp`, and silently doing
-    # nothing is a worse answer than saying so.
     if not args.strip_optim and args.dtype is None:
         p.error("nothing to do: pass --strip-optim and/or --dtype (a plain copy is `cp`)")
 
     src = Path(args.ckpt)
     out_dir = Path(args.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Name the file after what was done to it, so a stripped checkpoint is not
-    # mistaken for a resumable one months later.
+    # e.g. step_0040000.bfloat16.weights.pt
     parts = [
         src.stem,
         *([args.dtype] if args.dtype else []),
@@ -63,9 +60,6 @@ def main(argv: list[str] | None = None) -> int:
         }
     read = time.perf_counter() - t0
 
-    # Keep the whole checkpoint by default, rather than rebuilding it from the
-    # keys known today: a later key added to save_checkpoint would otherwise be
-    # dropped here without anything failing.
     out = {k: ckpt[k] for k in INFERENCE_KEYS} if args.strip_optim else ckpt
     torch.save(out, dst)
 

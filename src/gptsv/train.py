@@ -1,16 +1,10 @@
-"""Pretraining entrypoint. Same file for 1 GPU, 4x RTX 3060, and a GH200 node.
+"""Pretraining entrypoint, on a single device or data-parallel with DDP.
 
-    # phase 0 - single GPU
-    gptsv-train --config configs/phase0_150m.toml
+    # single device
+    gptsv-train --config configs/debug.toml
 
-    # phase 1 - 4x RTX 3060 (DDP; no NVLink, no P2P, so keep it data-parallel)
-    torchrun --nproc_per_node=4 -m gptsv.train --config configs/phase1_500m.toml
-
-    # phase 2 - single GH200 node, FSDP2
-    torchrun --nproc_per_node=4 -m gptsv.train --config configs/phase2_1p5b.toml
-
-Beyond a single node, hand the model over to torchtitan for TP/PP/CP - see
-torchtitan. This loop is deliberately data-parallel only: no TP, PP or CP.
+    # all GPUs on one machine (see scripts/train.sh)
+    torchrun --nproc_per_node=4 -m gptsv.train --config configs/430m.toml
 """
 
 from __future__ import annotations
@@ -49,10 +43,8 @@ DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": to
 class TrainWrapper(nn.Module):
     """Puts the loss computation inside `forward`.
 
-    This is not cosmetic: DDP prepares its gradient reducer inside
-    `DistributedDataParallel.forward`, so calling `model.loss(...)` directly on
-    the inner module would silently skip gradient synchronisation. Everything
-    in the training loop goes through this wrapper.
+    DDP sets up gradient synchronisation in its `forward`, so calling
+    `model.loss(...)` on the inner module would skip it.
     """
 
     def __init__(self, model):
@@ -82,14 +74,8 @@ def parse_overrides(pairs: list[str]) -> dict:
 def wrap_parallel(model, cfg: Config, info):
     """Return (train_module, parallel_root).
 
-    `parallel_root` is the module that owns gradient synchronisation, kept
-    separate because `torch.compile` is applied afterwards.
-
-    Both DDP and FSDP2 install their hooks on a module's `__call__`, so the
-    root of the parallel wrapping must be the *same* module the training loop
-    invokes - here, `TrainWrapper`. Sharding the raw model and then calling
-    `model.loss(...)` through a wrapper silently skips the root pre-forward
-    all-gather and fails with "mixed torch.Tensor and DTensor".
+    `parallel_root` is the DDP module, or None on a single device. It is kept
+    separately because `torch.compile` wraps `train_module` afterwards.
     """
     wrapped = TrainWrapper(model)
 
@@ -105,19 +91,6 @@ def wrap_parallel(model, cfg: Config, info):
             gradient_as_bucket_view=True,
         )
         return ddp, ddp
-
-    if cfg.train.parallel == "fsdp":
-        from torch.distributed.fsdp import fully_shard
-
-        # Shard per block so each all-gather overlaps with the previous
-        # block's compute. The root shard then covers what is left:
-        # embeddings, the output head and the final norm.
-        for block in model.layers:
-            fully_shard(block)
-        for head in model.mtp_heads:
-            fully_shard(head)
-        fully_shard(wrapped)
-        return wrapped, wrapped
 
     raise SystemExit(f"unknown train.parallel: {cfg.train.parallel!r}")
 
@@ -138,21 +111,16 @@ def grad_norm_groups(model) -> dict[str, list[nn.Parameter]]:
     return groups
 
 
-def set_grad_sync(parallel_root, cfg: Config, enabled: bool):
-    """Suppress gradient sync during grad-accum micro-steps."""
-    if parallel_root is None:
+def set_grad_sync(parallel_root, enabled: bool):
+    """Skip gradient sync on all but the last grad-accum micro-step."""
+    if parallel_root is None or enabled:
         return nullcontext()
-    if cfg.train.parallel == "ddp":
-        return nullcontext() if enabled else parallel_root.no_sync()
-    if cfg.train.parallel == "fsdp" and hasattr(parallel_root, "set_requires_gradient_sync"):
-        parallel_root.set_requires_gradient_sync(enabled)
-    return nullcontext()
+    return parallel_root.no_sync()
 
 
 @torch.no_grad()
 def evaluate(train_module, loader, steps: int, device, autocast_ctx, info) -> dict[str, float]:
-    # The same val batches every time, so the eval curve tracks the model
-    # rather than which slice of the val set happened to be drawn.
+    # Use the same val batches every time so evals are comparable.
     loader.seek(0)
     train_module.eval()
     totals: dict[str, float] = {}
@@ -251,8 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.train.wandb_project and info.is_master:
         import wandb
 
-        # A resumed run reuses the id stored in out_dir, so its metrics keep
-        # appending to the same wandb run instead of starting a new chart.
+        # Reuse the stored run id on resume so metrics continue the same run.
         id_file = out_dir / "wandb_run_id"
         resume_id = id_file.read_text().strip() if args.resume and id_file.exists() else None
         run = wandb.init(
@@ -274,20 +241,16 @@ def main(argv: list[str] | None = None) -> int:
             if info.is_master:
                 print(f"--resume auto: no checkpoint in {out_dir}, starting fresh")
         else:
-            # Keys are stored unprefixed, so restore into the raw model. Its
-            # parameters are the same objects DDP shares and FSDP2 sharded
-            # in place, so this reaches the parallel wrappers too.
+            # Keys are stored without wrapper prefixes, so load into the raw
+            # model. DDP shares its parameters, so it sees the result too.
             allow_missing = (r"mtp_heads\.\d+\.out_norm\.weight",) if cfg.model.mtp_out_norm else ()
             start_step, missing = load_checkpoint(path, model, optimizer, info, allow_missing)
-            # The loader is a pure function of (seed, rank, batch index), so
-            # seeking reproduces the exact data order the run would have had.
+            # Continue with the same data order as an uninterrupted run.
             train_loader.seek(start_step * cfg.train.grad_accum_steps)
             if info.is_master:
                 print(f"resumed from {path} at step {start_step}")
             if missing:
-                # Needs unsharded parameters, and the same batch on every rank.
-                if cfg.train.parallel == "fsdp" and info.enabled:
-                    raise SystemExit("adding mtp out_norm on resume is not supported under FSDP")
+                # Calibrate on the same batch on every rank.
                 calib = TokenLoader(
                     val_ds, cfg.train.micro_batch_size, block_len, cfg.train.seed, 0, 1
                 )
@@ -309,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
         z_sums: dict[str, torch.Tensor] = {}
         for micro in range(accum):
             tokens = next(train_loader).to(info.device, non_blocking=True)
-            ctx = set_grad_sync(parallel_root, cfg, enabled=(micro == accum - 1))
+            ctx = set_grad_sync(parallel_root, enabled=(micro == accum - 1))
             with ctx, autocast_ctx:
                 out = train_module(tokens)
                 loss = out.loss / accum
@@ -322,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         log_step = (step + 1) % cfg.train.log_interval == 0
         group_norms: dict[str, float] = {}
         if log_step:
-            # Pre-clip, and on every rank: under FSDP the norms are collectives.
+            # Measured before clipping.
             for key, params in norm_groups.items():
                 grads = [p.grad for p in params if p.grad is not None]
                 if grads:
@@ -396,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
                     keep_every=cfg.train.keep_every_n_steps,
                 )
                 print(f"step {step + 1:>7d} | checkpoint saved")
-                # Milestones accumulate; warn before a save can hit a full disk.
+                # Kept milestones add up over a run, so warn before the disk fills.
                 free, size = shutil.disk_usage(out_dir).free, ckpt_path.stat().st_size
                 if free < 2 * size:
                     print(

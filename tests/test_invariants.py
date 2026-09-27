@@ -1,14 +1,6 @@
-"""Invariants that fail *silently* if broken.
+"""Tests for bugs that would not crash training but would quietly hurt it.
 
-Deliberately not a full test suite. `scripts/smoke_test.sh` already proves the
-stack runs end to end - it exercises the model, Muon, MTP, eval and
-checkpointing under a real training loop, and it is what caught every crashing
-bug so far.
-
-What a smoke test cannot catch is a run that completes, converges, and is
-simply worse than it should be. Each test below guards one such failure: no
-exception, no visible loss anomaly, just days of GPU time spent on a slightly
-wrong model. That is the only reason these survived.
+`scripts/smoke_test.sh` covers the full training loop end to end.
 """
 
 import json
@@ -48,11 +40,9 @@ def tiny_cfg(**kw) -> ModelConfig:
 def test_meta_load_matches_eager_construction(tmp_path):
     """Loading via `meta` must produce the same model as constructing eagerly.
 
-    `load_model` skips __init__ by building on `meta`, then adopts the
-    checkpoint's tensors with assign=True. Two things can go wrong silently:
-    assign replaces the Parameter objects, so a tied lm_head quietly becomes a
-    second copy that drifts from the embedding, and the rope buffers are
-    persistent=False, so they are absent from the state dict and stay on `meta`.
+    `load_model` builds on `meta` and loads with assign=True. That replaces the
+    Parameter objects, which unties lm_head from the embedding, and leaves the
+    non-persistent RoPE buffers on `meta`.
     """
     from gptsv.generate import load_model
 
@@ -78,8 +68,7 @@ def test_meta_load_matches_eager_construction(tmp_path):
 def test_mtp_targets_are_offset_correctly():
     """Depth k must predict token i+k+1 - one step further out than depth k-1.
 
-    An off-by-one here is the classic MTP bug: training runs, loss falls, and
-    the heads simply learn a shifted task. Nothing surfaces it at runtime.
+    An off-by-one here would still train, just on a shifted task.
     """
     cfg = tiny_cfg(n_mtp_heads=3)
     m = GPTSV(cfg)
@@ -101,12 +90,7 @@ def test_mtp_targets_are_offset_correctly():
 
 
 def test_chunked_loss_gradients_match():
-    """`loss_chunk_size` is a memory optimisation and must be exactly neutral.
-
-    It is only ever enabled on the 12GB tier, so a subtle gradient difference
-    would degrade phase 0 and phase 1 alone - and would look like a
-    small-model effect rather than a bug.
-    """
+    """`loss_chunk_size` only saves memory and must not change the gradients."""
     torch.manual_seed(0)
     m = GPTSV(tiny_cfg(n_mtp_heads=1, loss_chunk_size=0))
     m.train()
@@ -125,7 +109,7 @@ def test_chunked_loss_gradients_match():
 
 
 def test_grad_checkpointing_matches():
-    """Same contract for activation checkpointing: pure memory/compute trade."""
+    """Activation checkpointing must not change the gradients either."""
     torch.manual_seed(0)
     m = GPTSV(tiny_cfg(grad_checkpoint=False))
     m.train()
@@ -144,7 +128,7 @@ def test_grad_checkpointing_matches():
 
 
 def test_kv_cache_matches_full_forward():
-    """Cached decoding must reproduce full-sequence logits; a cache bug only degrades samples."""
+    """Cached decoding must reproduce the full-sequence logits."""
     torch.manual_seed(0)
     cfg = tiny_cfg()
     m = GPTSV(cfg).eval()
@@ -160,11 +144,7 @@ def test_kv_cache_matches_full_forward():
 
 
 def test_param_groups_exclude_embeddings():
-    """Muon must never reach the embedding table or the output head.
-
-    Orthogonalising them is known to hurt, and the damage shows up only as a
-    slightly worse model - never as an error.
-    """
+    """Muon must never get the embedding table or the output head."""
     m = GPTSV(tiny_cfg(tie_embeddings=False, n_mtp_heads=1))
     muon, adam = m.param_groups()
 
@@ -186,12 +166,7 @@ def shard_dir(tmp_path):
 
 
 def test_seek_reproduces_the_uninterrupted_order(shard_dir):
-    """Resume must see exactly the batches an uninterrupted run would have.
-
-    If `seek` drifts, a preempted run silently retrains on data it has already
-    seen (or skips data entirely). On a queue that preempts often, that quietly
-    becomes most of the run.
-    """
+    """A resumed run must see the same batches an uninterrupted run would have."""
     ds = ShardDataset(shard_dir)
     uninterrupted = TokenLoader(ds, 2, 33, seed=3, rank=1, world_size=2)
     expected = [next(uninterrupted) for _ in range(10)]
@@ -206,8 +181,8 @@ def test_reserved_special_tokens_keep_every_other_id():
     """Reserving special tokens must not change how ordinary text tokenizes.
 
     `gptsv.tokenizer.reserve` swaps a tokenizer's last merges for new special
-    tokens. If it dropped the wrong merges or shifted an ID, shards and
-    checkpoints would still load - the IDs would just mean different text.
+    tokens. Dropping the wrong merges or shifting an ID would change what the
+    IDs mean without any error.
     """
     rng = random.Random(0)
     words = [
@@ -243,7 +218,7 @@ def test_reserved_special_tokens_keep_every_other_id():
         if max(before) < cut:
             assert after == before
             untouched += 1
-    # both branches must be exercised, or the test proves nothing
+    # make sure both branches are exercised
     assert 0 < untouched < len(texts)
 
 
@@ -260,7 +235,7 @@ def test_pruning_never_deletes_milestones(tmp_path):
     from gptsv.utils import prune_checkpoints
 
     steps = list(range(200, 10001, 200))
-    for s in steps:  # prune after every save, exactly as train.py does
+    for s in steps:  # prune after every save, as train.py does
         _write_ckpts(tmp_path, [s])
         prune_checkpoints(tmp_path, 3, protect=tmp_path / f"step_{s:07d}.pt", keep_every=4000)
     assert _steps(tmp_path) == [4000, 8000, 9600, 9800, 10000]
@@ -339,7 +314,7 @@ def test_checkpoint_saved_before_mtp_out_norm_still_loads(tmp_path):
         reference = GPTSV(cfg).eval()
         saved = vars(cfg).copy()
         if not out_norm:
-            del saved["mtp_out_norm"]  # config written before the option existed
+            del saved["mtp_out_norm"]  # older configs lack the key
         path = tmp_path / f"ckpt_{out_norm}.pt"
         torch.save({"model": reference.state_dict(), "step": 1, "config": {"model": saved}}, path)
 

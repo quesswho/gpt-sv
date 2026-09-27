@@ -1,8 +1,4 @@
-"""Configuration dataclasses, loaded from TOML.
-
-One config file fully describes a run. The same file is used on 1 GPU and on a
-GH200 cluster; only `train.parallel`, batch sizes and the data paths change.
-"""
+"""Configuration dataclasses, loaded from TOML. One config file describes a run."""
 
 from __future__ import annotations
 
@@ -29,28 +25,22 @@ class ModelConfig:
     qk_norm: bool = True
     tie_embeddings: bool = True
 
-    # Multi-token prediction (DeepSeek-V3 style sequential heads).
-    # 0 disables it. Each head costs one extra transformer block + one extra
-    # full-vocab logit matrix in the loss, so memory grows noticeably.
+    # Multi-token prediction heads, as in DeepSeek-V3. 0 disables them. Each
+    # head adds one transformer block and one full-vocab logit matrix.
     n_mtp_heads: int = 0
     mtp_loss_weight: float = 0.3
-    # RMSNorm on each MTP output before the shared lm_head, as in DeepSeek-V3.
-    # Off by default so checkpoints saved without it rebuild unchanged.
+    # RMSNorm on each MTP output before the shared lm_head. Off by default so
+    # checkpoints saved without it still load.
     mtp_out_norm: bool = False
 
-    z_loss_weight: float = 1e-4  # stabilises logit scale; 0 disables
+    z_loss_weight: float = 1e-4  # keeps the logit scale in check; 0 disables
     init_std: float = 0.02
 
-    # Memory controls. Both matter enormously on a 12GB RTX 3060 and are
-    # usually left off on a 96GB GH200.
-    #
-    # loss_chunk_size: rows of [B*T, vocab] logits materialised at a time.
-    # The full logit tensor is the single largest allocation in a small model
-    # with a 65k vocab (8*2048 rows * 65536 * 4B = 4.3GB in fp32, per head,
-    # and MTP multiplies that). Chunks are recomputed in backward, so this
-    # trades a little compute for a large memory saving. 0 disables.
+    # Rows of the [B*T, vocab] logits computed at a time. With a 65k vocab the
+    # full logit tensor is the largest allocation in the model, so chunking it
+    # (and recomputing each chunk in backward) saves a lot of memory. 0 disables.
     loss_chunk_size: int = 0
-    # grad_checkpoint: recompute each transformer block in backward.
+    # Recompute each transformer block in backward.
     grad_checkpoint: bool = False
 
     def __post_init__(self) -> None:
@@ -76,9 +66,8 @@ class DataConfig:
 
 @dataclass
 class OptimConfig:
-    # Muon handles 2D hidden-layer matrices; AdamW handles embeddings, the
-    # output head, norms and biases. This split is the standard recipe
-    # (Moonlight / Kimi K2) - Muon on the embedding table hurts.
+    # Muon for the 2D hidden-layer matrices, AdamW for embeddings, the output
+    # head and norms.
     use_muon: bool = True
     muon_lr: float = 0.02
     muon_momentum: float = 0.95
@@ -111,7 +100,7 @@ class TrainConfig:
     grad_accum_steps: int = 1
     max_steps: int = 5000
 
-    parallel: str = "ddp"  # "ddp" | "fsdp" | "single"
+    parallel: str = "ddp"  # "ddp" | "single"
     dtype: str = "bfloat16"  # autocast dtype
     compile: bool = True
 

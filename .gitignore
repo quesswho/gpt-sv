@@ -41,5 +41,3 @@ venv/
 # exported Hugging Face models
 /hf/
 /.venv-eval/
-
-RUNBOOK.md

@@ -1,15 +1,11 @@
-"""Train a byte-level BPE tokenizer tuned for Swedish.
+"""Train a byte-level BPE tokenizer on Swedish text.
 
-This is the highest-leverage Swedish-specific decision in the project. Existing
-options are all compromises: GPT-SW3's tokenizer predates the current recipe,
-and the big multilingual tokenizers (Llama, Qwen, Gemma) spend most of their
-vocab elsewhere and fragment Swedish morphology badly. Swedish is heavily
-compounding - `arbetsmarknadsutbildning` - so fertility gains here are large
-and they convert directly into training compute saved for the life of the
-project.
+Multilingual tokenizers spend most of their vocabulary on other languages and
+split Swedish compounds such as `arbetsmarknadsutbildning` into many pieces. A
+Swedish-only vocabulary needs fewer tokens for the same text.
 
-    gptsv-tokenizer --dataset AI-Sweden-Models/SWEb --text-field text \
-        --langs sv --vocab-size 65536 --n-docs 2000000 --out tokenizers/sv64k
+    gptsv-tokenizer --files data/raw/fineweb2-swe/train/000_00000.parquet \
+        --vocab-size 65536 --n-docs 1000000 --out tokenizers/sv64k
 
 Then measure it: `gptsv-fertility --tokenizers tokenizers/sv64k ...`
 """
@@ -50,8 +46,8 @@ def main(argv: list[str] | None = None) -> int:
 
     tok = Tokenizer(models.BPE(unk_token=None, byte_fallback=False))
 
-    # Byte level means no UNK and no <unk> handling for aa/ae/oe or any other
-    # Unicode; digits split individually so numbers stay compositional.
+    # Byte level, so any Unicode input is covered without an unknown token.
+    # Digits are split one by one.
     stages = []
     if args.split_digits:
         stages.append(pre_tokenizers.Digits(individual_digits=True))

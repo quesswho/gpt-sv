@@ -2,8 +2,7 @@
 
 A shard is a flat `.bin` file of token ids (documents concatenated, each one
 terminated by `<|endoftext|>`), written by `gptsv-data tokenize`. Shards are
-memory-mapped, so the page cache does the work and startup is instant at any
-corpus size.
+memory-mapped, so startup is fast at any corpus size.
 """
 
 from __future__ import annotations
@@ -35,15 +34,11 @@ class ShardDataset:
 class TokenLoader:
     """Yields [batch_size, block_len] int64 batches of non-overlapping token blocks.
 
-    Each shard is cut into non-overlapping blocks. Every epoch visits each
-    block exactly once, in an order drawn from (seed, epoch), dealt round-robin
-    across ranks - so no rank repeats or skips data within an epoch, unlike
-    sampling random offsets, which leaves ~37% of the corpus unseen after one
-    nominal pass.
+    Each epoch visits every block exactly once, in an order drawn from
+    (seed, epoch) and dealt round-robin across ranks.
 
-    Batch `i` is a pure function of (seed, rank, world_size, i). That is what
-    makes `seek` exact: a resumed run sees precisely the batches an
-    uninterrupted run would have.
+    Batch `i` depends only on (seed, rank, world_size, i), so after `seek` a
+    resumed run sees the same batches an uninterrupted run would have.
     """
 
     def __init__(
@@ -84,8 +79,7 @@ class TokenLoader:
 
     def _perm(self, epoch: int) -> np.ndarray:
         if epoch not in self._perms:
-            # A batch can straddle an epoch boundary, so keep the previous
-            # epoch's order around rather than regenerating it per sample.
+            # Keep the previous epoch's order for batches that span two epochs.
             self._perms = {e: p for e, p in self._perms.items() if e == epoch - 1}
             rng = np.random.default_rng([self.seed, epoch])
             self._perms[epoch] = rng.permutation(self.n_blocks)

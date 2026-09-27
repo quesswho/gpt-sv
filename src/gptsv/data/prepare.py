@@ -5,7 +5,7 @@
 
     # tokenize into flat uint16 shards, <|endoftext|> after every document
     gptsv-data tokenize --files data/raw/fineweb2-swe/train/*.parquet \\
-        --tokenizer tokenizers/sv64k --out data/shards/sv/train --max-tokens 3e9
+        --tokenizer tokenizers/sv64k-v2 --out data/shards/sv64k-v2/train --max-tokens 11e9
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ class ShardWriter:
     """Streams token ids into fixed-size shard files.
 
     Each shard is written to a temp name and renamed once complete, so an
-    interrupted run never leaves a truncated shard that looks valid.
+    interrupted run does not leave a truncated shard behind.
     """
 
     def __init__(self, out_dir: Path, shard_tokens: int, dtype: np.dtype):

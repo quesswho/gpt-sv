@@ -1,7 +1,7 @@
 """Where raw documents come from: local files or a HuggingFace dataset.
 
-Shared by `gptsv-tokenizer` and `gptsv-data`, so the tokenizer is trained on
-exactly the same kind of text stream the shards are built from.
+Shared by `gptsv-tokenizer` and `gptsv-data`, so the tokenizer is trained on the
+same text stream the shards are built from.
 """
 
 from __future__ import annotations

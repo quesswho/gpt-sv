@@ -1,15 +1,10 @@
-"""Self-contained decoder-only transformer for the gpt-sv family.
-
-Deliberately one file with no framework dependency beyond torch, so the exact
-same module is used by the phase-0 single-GPU loop, the phase-1 DDP/FSDP2 loop,
-and (phase 2) a torchtitan `TrainSpec` - `layers` and `mtp_heads` are flat
-ModuleLists so a TP/PP plan can be applied without touching this file.
+"""Decoder-only transformer for gpt-sv, depending on nothing but torch.
 
 Architecture: RMSNorm (pre-norm), SwiGLU, RoPE, GQA, QK-norm, optional tied
 embeddings, optional DeepSeek-V3-style multi-token-prediction heads.
 
-Conventions follow Llama/HF (rotate-half RoPE, `wq/wk/wv/wo`, `w1/w2/w3`) so
-converting to a `transformers` checkpoint later is mechanical.
+Conventions follow Llama/HF (rotate-half RoPE, `wq/wk/wv/wo`, `w1/w2/w3`), so
+the weights map directly onto Qwen3 in `transformers` (see `gptsv.hf`).
 """
 
 from __future__ import annotations
@@ -99,8 +94,7 @@ class Attention(nn.Module):
         self.wv = nn.Linear(cfg.dim, cfg.n_kv_heads * cfg.head_dim, bias=False)
         self.wo = nn.Linear(cfg.n_heads * cfg.head_dim, cfg.dim, bias=False)
 
-        # QK-norm: keeps attention logits in range and is the cheapest known
-        # fix for late-training loss spikes at >1B scale.
+        # QK-norm keeps the attention logits bounded, which avoids loss spikes.
         self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps) if cfg.qk_norm else nn.Identity()
         self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps) if cfg.qk_norm else nn.Identity()
 
@@ -167,10 +161,10 @@ class MTPHead(nn.Module):
     """One DeepSeek-V3 multi-token-prediction depth.
 
     Takes the previous depth's hidden state h at position i and the embedding of
-    the token at i+k, and predicts the token at i+k+1 through the *shared*
-    output head. Embedding and output head are shared with the trunk, so each
-    head costs one block + one projection. `out_norm` normalises what reaches
-    the output head; the next depth receives the un-normalised state.
+    the token at i+k, and predicts the token at i+k+1. The embedding and output
+    head are shared with the trunk, so each depth adds one block and one
+    projection. `out_norm` is applied only to what goes into the output head;
+    the next depth gets the unnormalised state.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -288,8 +282,8 @@ class GPTSV(nn.Module):
         chunk = self.cfg.loss_chunk_size
         n = hf.size(0)
 
-        # Sum-reduce, then divide once at the end: chunks are not all the same
-        # size, so averaging per chunk would silently overweight the last one.
+        # Sum over chunks and divide once at the end, since the last chunk can
+        # be smaller than the others.
         def compute(h_chunk: torch.Tensor, t_chunk: torch.Tensor):
             logits = self.lm_head(h_chunk).float()
             ce = F.cross_entropy(logits, t_chunk, reduction="sum")
@@ -316,8 +310,8 @@ class GPTSV(nn.Module):
     def loss(self, tokens: torch.Tensor) -> LossOutput:
         """tokens: [B, L] where L == block_len(). Returns the training loss.
 
-        Slicing is static (no masking) because the loader always supplies the
-        extra D+1 lookahead tokens, which keeps this torch.compile friendly.
+        The loader always supplies the D+1 extra lookahead tokens, so slicing is
+        static and needs no masking, which suits torch.compile.
         """
         cfg = self.cfg
         expected = self.block_len()
@@ -364,7 +358,7 @@ class GPTSV(nn.Module):
     def calibrate_mtp_out_norm(self, tokens: torch.Tensor) -> None:
         """Fit each MTP out_norm gain so the normalised output matches the raw one.
 
-        For resuming a checkpoint trained without out_norm: a per-channel
+        Used when resuming a checkpoint trained without out_norm. A per-channel
         least-squares gain keeps the head's output scale instead of resetting it
         to unit RMS. `tokens` is a [B, block_len()] batch.
         """
@@ -400,9 +394,9 @@ class GPTSV(nn.Module):
     def param_groups(self) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
         """Split params into (muon_params, adam_params).
 
-        Muon gets 2D hidden matrices only. Embeddings, the output head, all
-        norms and biases go to AdamW - orthogonalising the embedding table is
-        known to hurt, and 1D tensors have no meaningful spectral norm.
+        Muon gets the 2D hidden matrices. Embeddings, the output head and all
+        norms go to AdamW, since Muon works poorly on embedding tables and does
+        not apply to 1D tensors.
         """
         muon, adam = [], []
         excluded = {id(self.tok_emb.weight), id(self.lm_head.weight)}

@@ -1,21 +1,9 @@
-"""Muon: momentum + Newton-Schulz orthogonalisation of the update.
+"""Muon: momentum followed by Newton-Schulz orthogonalisation of the update.
 
-Reference: Jordan et al. (modded-nanogpt), scaled up in Moonlight (16B MoE /
-5.7T tokens) and Kimi K2 (1T params / 15.5T tokens). Muon is applied only to
-2D hidden matrices; embeddings, the output head and all 1D tensors use AdamW.
-
-Distributed notes
------------------
-* DDP: parameters are replicated, so each rank holds the full matrix and
-  Newton-Schulz runs locally. No extra communication. This is the phase-0/1
-  path and it is exact.
-* FSDP2: parameters are DTensors sharded across ranks. Orthogonalisation is
-  *not* a per-element op, so the matrix must be whole. We keep the momentum
-  buffer sharded (momentum is elementwise, so that part is safe), then
-  all-gather only the resulting update, orthogonalise, and re-shard. That is
-  one all-gather per matrix per step - correct, but it does not scale to very
-  large world sizes. For phase 2, prefer a genuinely distributed Muon:
-  Megatron-Core's `Emerging-Optimizers` (Apr 2026) or torchtitan #2494.
+From Jordan et al. (modded-nanogpt), with the update scaling from Moonlight.
+Muon is applied only to 2D hidden matrices; embeddings, the output head and all
+1D tensors use AdamW. Under DDP every rank holds the full matrices, so the
+orthogonalisation runs locally with no extra communication.
 """
 
 from __future__ import annotations
@@ -23,20 +11,8 @@ from __future__ import annotations
 import torch
 from torch.optim import Optimizer
 
-try:  # torch >= 2.4
-    from torch.distributed.tensor import DTensor, distribute_tensor
-
-    _HAS_DTENSOR = True
-except ImportError:  # pragma: no cover
-    DTensor = None  # type: ignore[assignment]
-    distribute_tensor = None  # type: ignore[assignment]
-    _HAS_DTENSOR = False
-
-
-# Quintic iteration coefficients tuned to push the singular values of the
-# normalised matrix towards 1 in as few steps as possible. The iteration does
-# not converge to an exact orthogonalisation - it does not need to; what
-# matters is that the spectrum is squashed into a narrow band.
+# Quintic iteration coefficients that push the singular values towards 1 in few
+# steps. The result is only approximately orthogonal, which is enough.
 _NS_COEFFS = (3.4445, -4.7750, 2.0315)
 
 
@@ -44,8 +20,7 @@ _NS_COEFFS = (3.4445, -4.7750, 2.0315)
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
     """Approximate the orthogonal factor of G via a quintic Newton-Schulz iteration.
 
-    Runs in bfloat16 by design: the iteration is numerically forgiving and this
-    is on the critical path of every step.
+    Runs in bfloat16, which the iteration tolerates well.
     """
     assert G.ndim >= 2, "Muon expects matrices"
     a, b, c = _NS_COEFFS
@@ -61,20 +36,6 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e
     if transposed:
         X = X.mT
     return X.to(G.dtype)
-
-
-def _gather(t: torch.Tensor):
-    """Return (full_tensor, resharding_spec_or_None)."""
-    if _HAS_DTENSOR and isinstance(t, DTensor):
-        return t.full_tensor(), (t.device_mesh, t.placements)
-    return t, None
-
-
-def _scatter(full: torch.Tensor, spec) -> torch.Tensor:
-    if spec is None:
-        return full
-    mesh, placements = spec
-    return distribute_tensor(full, mesh, placements)
 
 
 class Muon(Optimizer):
@@ -132,18 +93,12 @@ class Muon(Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(g)
                 buf = state["momentum_buffer"]
 
-                # Elementwise, so safe to run directly on a sharded DTensor.
                 buf.lerp_(g, 1.0 - momentum)
                 update = g.lerp(buf, momentum) if nesterov else buf
+                ortho = zeropower_via_newtonschulz5(update, steps=ns_steps)
 
-                # Orthogonalisation needs the whole matrix.
-                full, spec = _gather(update)
-                ortho_full = zeropower_via_newtonschulz5(full, steps=ns_steps)
-                ortho = _scatter(ortho_full, spec)
-
-                # RMS-matching scale (Moonlight): keeps the update magnitude
-                # comparable to AdamW's across very non-square matrices, which
-                # is what makes AdamW-tuned learning rates transfer.
+                # Scale up tall matrices so their update size stays comparable
+                # to wide ones.
                 rows, cols = p.shape[-2], p.shape[-1]
                 scale = max(1.0, rows / cols) ** 0.5
 
@@ -157,8 +112,8 @@ class Muon(Optimizer):
 class OptimizerGroup:
     """Drives several optimizers as one, with a shared LR multiplier.
 
-    Each optimizer keeps its own base LR (Muon and AdamW live on completely
-    different scales); the scheduler supplies a single 0..1 multiplier.
+    Each optimizer keeps its own base LR, since Muon and AdamW use very
+    different scales. The scheduler supplies a single 0..1 multiplier.
     """
 
     def __init__(self, optimizers: list[Optimizer]):
@@ -215,8 +170,7 @@ def build_optimizer(model, cfg) -> OptimizerGroup:
             )
         )
     if adam_params:
-        # Weight decay is applied to >=2D tensors only; decaying norm gains and
-        # biases is a well-known small regression.
+        # No weight decay on norm gains and other 1D tensors.
         decay = [p for p in adam_params if p.ndim >= 2]
         no_decay = [p for p in adam_params if p.ndim < 2]
         groups = []

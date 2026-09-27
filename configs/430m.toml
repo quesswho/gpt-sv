@@ -1,12 +1,9 @@
-# Phase 1 - 4x RTX 3060 12GB, DDP.
+# gpt-sv 430M, data-parallel over every GPU on one machine.
 #
-#   torchrun --nproc_per_node=4 -m gptsv.train --config configs/phase1_430m.toml
+#   scripts/train.sh
 #
-# The point of this tier is INFRASTRUCTURE CONFIDENCE, not throughput.
-# GeForce cards have no NVLink and P2P is disabled in the driver, so all-reduce
-# goes over PCIe host memory. Keep it data-parallel: tensor parallelism at this
-# interconnect is slower than a single GPU. Verify here that checkpoint save /
-# resume, determinism, and distributed Muon all behave, then move on.
+# train.sh picks micro_batch_size from free GPU memory and sets grad_accum_steps
+# so the global batch stays at 128 sequences. The values below are for 4 GPUs.
 
 [model]
 vocab_size = 65536
@@ -25,7 +22,7 @@ loss_chunk_size = 2048
 grad_checkpoint = false
 
 [data]
-# scripts/prepare_phase1_data.sh - sv64k-v2 tokenizer (sv64k + chat/reserved specials)
+# scripts/prepare_data.sh - sv64k-v2 tokenizer (sv64k + chat/reserved specials)
 train_dir = "data/shards/sv64k-v2/train"
 val_dir = "data/shards/sv64k-v2/val"
 dtype = "uint16"
@@ -41,11 +38,11 @@ warmup_steps = 500
 decay_frac = 0.2
 
 [train]
-out_dir = "out/phase1_430m"
+out_dir = "out/430m"
 seq_len = 2048
 micro_batch_size = 2
 grad_accum_steps = 16   # 2*16*2048*4 GPUs = 262k tokens/step
-max_steps = 40000       # ~10B tokens
+max_steps = 40000       # ~10.5B tokens
 parallel = "ddp"
 dtype = "bfloat16"
 compile = true
@@ -56,4 +53,4 @@ ckpt_interval = 200
 keep_last_n_ckpts = 3
 keep_every_n_steps = 4000  # ~55 GB with the rolling 3
 wandb_project = "gpt-sv"
-wandb_run_name = "phase1-430m"
+wandb_run_name = "gpt-sv-430m"

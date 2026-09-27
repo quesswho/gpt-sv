@@ -1,6 +1,6 @@
 """Sample text from a gpt-sv checkpoint.
 
-    gptsv-generate --ckpt out/phase0_130m/step_0004000.pt --prompt "Stockholm är"
+    gptsv-generate --ckpt out/430m/step_0040000.pt --prompt "Stockholm är"
 """
 
 from __future__ import annotations
@@ -22,8 +22,11 @@ EOT = SPECIAL_TOKENS[0]
 def load_model(
     path: str, device: torch.device, dtype: torch.dtype | None = None
 ) -> tuple[GPTSV, int]:
-    """Load a checkpoint for inference. Builds on `meta` to skip __init__'s
-    trunc_normal_ over every parameter, ~42s at 448M and overwritten anyway."""
+    """Load a checkpoint for inference.
+
+    The model is built on the `meta` device to skip the random init, which is
+    slow and would be overwritten anyway.
+    """
     ckpt = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
     cfg = ModelConfig(**ckpt["config"]["model"])
 
@@ -31,7 +34,7 @@ def load_model(
         model = GPTSV(cfg)
     model.load_state_dict(ckpt["model"], assign=True, strict=True)
 
-    # persistent=False, so absent from the state dict and still meta after load
+    # Not in the state dict (persistent=False), so still on meta after loading.
     model.rope_cos, model.rope_sin = precompute_rope(
         cfg.head_dim, cfg.max_seq_len, cfg.rope_theta
     )
@@ -39,10 +42,10 @@ def load_model(
     model = model.to(device)
     if dtype is not None:
         model = model.to(dtype)
-        # keep rope in fp32: bf16 cos/sin carries ~3 digits of a rotation angle
+        # Keep RoPE in fp32; bf16 is too coarse for the rotation angles.
         model.rope_cos = model.rope_cos.float()
         model.rope_sin = model.rope_sin.float()
-    if cfg.tie_embeddings:  # assign=True replaced the shared Parameter
+    if cfg.tie_embeddings:  # assign=True untied them
         model.lm_head.weight = model.tok_emb.weight
     return model.eval(), int(ckpt["step"])
 
@@ -91,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="gptsv-generate", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--ckpt", required=True, help="checkpoint .pt written by gptsv-train")
-    p.add_argument("--tokenizer", default="tokenizers/sv64k", help="dir containing tokenizer.json")
+    p.add_argument("--tokenizer", default="tokenizers/sv64k-v2", help="dir containing tokenizer.json")
     p.add_argument("--prompt", default="", help="empty = start a fresh document")
     p.add_argument("--max-new-tokens", type=int, default=200)
     p.add_argument("--temperature", type=float, default=0.8, help="0 = greedy")

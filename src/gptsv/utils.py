@@ -37,8 +37,7 @@ class DistInfo:
 def setup_distributed() -> DistInfo:
     """Initialise from torchrun env vars if present, else return a single-process info.
 
-    Backend is nccl on CUDA and gloo otherwise, so the same entrypoint works on
-    a laptop CPU, on 4x RTX 3060, and on a GH200 node.
+    Uses nccl on CUDA and gloo otherwise.
     """
     if "RANK" not in os.environ:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -82,9 +81,8 @@ def all_reduce_mean(x: torch.Tensor, info: DistInfo) -> torch.Tensor:
 def lr_multiplier(step: int, max_steps: int, cfg: ScheduleConfig) -> float:
     """Warmup-stable-decay multiplier in [0, 1], applied to every base LR.
 
-    WSD holds a constant LR for most of training, so a run can be branched or
-    extended without re-planning a whole cosine curve - which matters when the
-    same recipe is scaled across three very different machines.
+    WSD holds a constant LR for most of training, so a run can be extended or
+    branched without redoing the whole schedule.
     """
     warmup = cfg.warmup_steps
     if warmup > 0 and step < warmup:
@@ -94,7 +92,7 @@ def lr_multiplier(step: int, max_steps: int, cfg: ScheduleConfig) -> float:
     if step < decay_start:
         return 1.0
     progress = min(1.0, max(0.0, (step - decay_start) / max(1, max_steps - decay_start)))
-    # 1 - sqrt decay: empirically stronger than linear for WSD.
+    # 1 - sqrt decay tends to beat linear for WSD.
     return cfg.lr_min_frac + (1.0 - cfg.lr_min_frac) * (1.0 - math.sqrt(progress))
 
 
@@ -109,9 +107,7 @@ _WRAPPER_PREFIXES = ("module.", "_orig_mod.", "model.")
 def strip_wrapper_prefixes(sd: dict) -> dict:
     """Remove DDP / torch.compile / TrainWrapper key prefixes.
 
-    A checkpoint should be loadable into a bare `GPTSV`, whatever it was
-    trained under - otherwise phase-0 and phase-2 checkpoints are not
-    interchangeable, which defeats the point of the whole ladder.
+    Checkpoints then load into a bare `GPTSV` however they were trained.
     """
     out = {}
     for key, value in sd.items():
@@ -129,12 +125,8 @@ def strip_wrapper_prefixes(sd: dict) -> dict:
 def save_checkpoint(path: Path, model, optimizer, step: int, cfg_dict: dict, info: DistInfo) -> None:
     """Rank-0 full-state checkpoint.
 
-    `model` must be the parallel root (the module DDP/FSDP2 wrapped), so that
-    `get_model_state_dict` gathers sharded DTensors correctly. Wrapper key
-    prefixes are stripped before writing.
-
-    Fine up to a few B params; past that switch to
-    `torch.distributed.checkpoint.save` for sharded, parallel writes.
+    `model` is the DDP module when training in parallel. Wrapper key prefixes
+    are stripped before writing.
     """
     from torch.distributed.checkpoint.state_dict import (
         StateDictOptions,
@@ -142,13 +134,9 @@ def save_checkpoint(path: Path, model, optimizer, step: int, cfg_dict: dict, inf
         get_optimizer_state_dict,
     )
 
-    # full_state_dict gathers FSDP2's sharded DTensors into plain tensors on
-    # rank 0; without it the checkpoint contains DTensors and can only be
-    # loaded back into an identically-sharded model.
     opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
 
-    # Both calls are collective - every rank must participate before the
-    # rank-0-only write below.
+    # Every rank takes part in these calls; only rank 0 writes the file.
     model_sd = strip_wrapper_prefixes(get_model_state_dict(model, options=opts))
     optim_sd = [get_optimizer_state_dict(model, o, options=opts) for o in optimizer.optimizers]
     if not info.is_master:
@@ -180,10 +168,7 @@ def load_checkpoint(
     keys that fully match one of the `allow_missing` regexes; those keep their
     initial values. set_model_state_dict does not enforce this itself.
 
-    Loads the full (unsharded) state on every rank and lets
-    `set_model_state_dict` re-shard it, so a checkpoint written on N GPUs can
-    be resumed on M - which is the whole point when phase 1 runs on 4x3060 and
-    phase 2 runs on GH200.
+    Checkpoints hold the full state, so one written on N GPUs can be resumed on M.
     """
     from torch.distributed.checkpoint.state_dict import (
         StateDictOptions,
@@ -206,9 +191,8 @@ def load_checkpoint(
     )
     set_model_state_dict(model, ckpt["model"], options=opts)
 
-    # Muon and AdamW each own a disjoint subset of the parameters, so from any
-    # single optimizer's point of view most parameters legitimately have no
-    # saved state. strict=False is the supported way to say so.
+    # Muon and AdamW each own only some of the parameters, so each optimizer
+    # has no state for the rest. strict=False allows that.
     opt_opts = StateDictOptions(
         full_state_dict=True, broadcast_from_rank0=info.enabled, strict=False
     )
@@ -222,10 +206,9 @@ def prune_checkpoints(
 ) -> None:
     """Keep the `keep` highest-numbered checkpoints.
 
-    `protect` is never deleted. Without it, resuming into an out_dir that
-    already holds higher-numbered checkpoints from a previous run would delete
-    the checkpoint that was just written. Checkpoints at a multiple of
-    `keep_every` are never deleted either.
+    `protect` is never deleted, so the checkpoint just written survives even
+    if out_dir holds higher-numbered ones from an earlier run. Checkpoints at a
+    multiple of `keep_every` are never deleted either.
     """
     if keep <= 0:
         return

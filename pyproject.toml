@@ -1,7 +1,7 @@
 [project]
 name = "gptsv"
 version = "0.0.1"
-description = "A family of Swedish-first language models: modern architecture, MTP, Muon."
+description = "Training code for gpt-sv, a 430M-parameter Swedish language model."
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.5",
@@ -42,8 +42,7 @@ select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
-# /tokenizers/ holds trained tokenizer artifacts; without this, ruff mistakes
-# the `tokenizers` library for a first-party package.
+# Keeps ruff from treating the local tokenizers/ directory as a first-party package.
 known-third-party = ["tokenizers"]
 
 [tool.pytest.ini_options]

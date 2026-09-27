@@ -37,9 +37,8 @@ def reserve_special_tokens(tokenizer_json: dict, new_tokens: list[str]) -> dict:
     if any(a["id"] >= cut for a in d["added_tokens"]):
         raise ValueError(f"an added token already sits in the top {k} IDs")
 
-    # Only valid if the last k merges are exactly what produced the top k IDs.
-    # Checked rather than assumed: a mismatch would silently remap ordinary
-    # tokens, and every shard would still load - just meaning different text.
+    # Only valid if the last k merges produced exactly the top k IDs. Otherwise
+    # ordinary tokens would be remapped without any error.
     pairs = [m.split(" ") if isinstance(m, str) else m for m in merges[-k:]]
     if {vocab.get("".join(p)) for p in pairs} != set(range(cut, n)):
         raise ValueError(f"the last {k} merges do not map onto the top {k} IDs")
@@ -91,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     new_tokens = CHAT_TOKENS + [f"<|reserved_{i}|>" for i in range(n_new - len(CHAT_TOKENS))]
 
-    # Round-trip through the library, so the saved file is one it has accepted.
+    # Round-trip through the library so the saved file is known to load.
     tok = Tokenizer.from_str(json.dumps(reserve_special_tokens(tok_json, new_tokens)))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

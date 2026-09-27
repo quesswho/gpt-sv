@@ -1,12 +1,10 @@
-"""Measure tokenizer fertility on Swedish and report the compute implication.
+"""Compare tokenizer fertility (tokens per word) on Swedish text.
 
-Fertility (tokens per whitespace word) is the number that matters: a tokenizer
-with 25% lower fertility trains on 25% more text for the same token budget, for
-free, forever. Run this before committing to a vocab size - it is the cheapest
-experiment in the whole project.
+A tokenizer with 25% lower fertility fits 25% more text into the same token
+budget.
 
     gptsv-fertility --text-file data/eval/sv_sample.txt \
-        --tokenizers tokenizers/sv64k \
+        --tokenizers tokenizers/sv64k-v2 \
         --hf-tokenizers AI-Sweden-Models/gpt-sw3-6.7b meta-llama/Llama-3.1-8B Qwen/Qwen3-8B
 
 Compares against the first entry as baseline unless --baseline is given.

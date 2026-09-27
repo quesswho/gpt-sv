@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate random token shards so the pipeline can be smoke-tested offline.
 
-Not a corpus - just enough structure to prove the loader, model, optimizer,
-checkpointing and eval path all run end to end without any download.
+The data is a repeating motif with noise, enough to check that the loader,
+model, optimizer, checkpointing and eval all work without any download.
 
     python scripts/make_debug_data.py
     gptsv-train --config configs/debug.toml
@@ -30,9 +30,7 @@ def main() -> None:
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    # One motif shared by train and val (different noise draws), so val loss
-    # falls too - otherwise the smoke test cannot tell a working eval path
-    # from a broken one.
+    # Train and val share the motif, so val loss falls too.
     motif = rng.integers(0, args.vocab_size, size=args.period, dtype=np.uint16)
 
     for split, total in (("train", args.train_tokens), ("val", args.val_tokens)):
@@ -40,10 +38,7 @@ def main() -> None:
         d.mkdir(parents=True, exist_ok=True)
         per = total // args.shards
         for i in range(args.shards):
-            # A short repeating motif plus noise. The period is deliberately
-            # smaller than any sane seq_len, so the loss MUST fall well below
-            # ln(vocab) - that is what makes the smoke test informative rather
-            # than merely non-crashing.
+            # The period is shorter than seq_len, so the model can learn it.
             arr = np.tile(motif, per // args.period + 1)[:per].astype(np.uint16)
             noise = rng.random(arr.shape) < args.noise
             arr[noise] = rng.integers(0, args.vocab_size, size=int(noise.sum()), dtype=np.uint16)

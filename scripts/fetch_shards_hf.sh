@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# Pull the sv64k-v2 shards onto a training host. Run after the code is synced.
-#
-# Kept out of any provider's machine-boot hook on purpose: those run before this
-# repo exists on the host, and the download needs HF_TOKEN for a private repo.
+# Download the sv64k-v2 shards from a Hugging Face dataset repo onto the
+# training machine.
 #
 #   HF_TOKEN=hf_... HF_DATASET=<user>/gptsv-sv64k-v2 scripts/fetch_shards_hf.sh
 #
-# Downloads land where configs/phase1_430m.toml expects them
+# Files land where configs/430m.toml expects them
 # (data/shards/sv64k-v2/{train,val}). Re-running resumes a partial download.
 #
 set -euo pipefail
@@ -23,8 +21,7 @@ fi
 mkdir -p "$SHARDS"
 "$HF" download "$HF_DATASET" --repo-type dataset --local-dir "$SHARDS"
 
-# The loader trusts meta.json's n_tokens; a truncated download would otherwise
-# surface as a confusing memmap error thousands of steps in.
+# Check the token count against meta.json to catch truncated downloads.
 "$PYTHON" - "$SHARDS" <<'PY'
 import json, pathlib, sys
 

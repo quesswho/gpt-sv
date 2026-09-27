@@ -1,10 +1,11 @@
 """Export a gpt-sv checkpoint as a Hugging Face Qwen3ForCausalLM.
 
-    gptsv-export-hf out/phase1_430m/step_0040000.pt hf/phase1_430m --tokenizer tokenizers/sv64k-v2
+    gptsv-export-hf out/430m/step_0040000.pt hf/gpt-sv-430m --tokenizer tokenizers/sv64k-v2
 
-GPTSV is architecturally Qwen3 (pre-norm, GQA, per-head QK RMSNorm before
-rotate-half RoPE, SwiGLU, no biases), so the export is a rename. MTP heads are
-dropped. Every export is checked for logit parity against GPTSV.
+GPTSV has the same architecture as Qwen3 (pre-norm, GQA, per-head QK RMSNorm
+before rotate-half RoPE, SwiGLU, no biases), so exporting is a matter of
+renaming weights. MTP heads are dropped. Every export is checked to produce the
+same logits as GPTSV.
 """
 
 from __future__ import annotations
@@ -57,8 +58,7 @@ def qwen3_config(cfg: ModelConfig, eot_id: int | None = None, pad_id: int | None
         eos_token_id=eot_id,
         pad_token_id=pad_id,
     )
-    # transformers 4.x reads the top-level key and ignores `rope_parameters`,
-    # so without it an older loader would silently use its default theta.
+    # transformers 4.x reads rope_theta from the top level, not rope_parameters.
     hf_cfg.rope_theta = cfg.rope_theta
     return hf_cfg
 
@@ -151,8 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(args.out_dir)
     hf_model.to(getattr(torch, args.dtype)).save_pretrained(out)
     tok.save_pretrained(out)
-    # transformers 5 records its own `TokenizersBackend`, a class 4.x does not
-    # have. Both versions load a tokenizer.json through PreTrainedTokenizerFast.
+    # transformers 5 saves a tokenizer class that 4.x does not have.
     tok_cfg_path = out / "tokenizer_config.json"
     tok_cfg = json.loads(tok_cfg_path.read_text())
     tok_cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
