@@ -10,6 +10,7 @@ dropped. Every export is checked for logit parity against GPTSV.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -38,7 +39,7 @@ def qwen3_config(cfg: ModelConfig, eot_id: int | None = None, pad_id: int | None
 
     if not cfg.qk_norm:
         raise ValueError("Qwen3 always applies QK-norm; this checkpoint was trained without it")
-    return Qwen3Config(
+    hf_cfg = Qwen3Config(
         vocab_size=cfg.vocab_size,
         hidden_size=cfg.dim,
         intermediate_size=cfg.ffn_hidden,
@@ -56,6 +57,10 @@ def qwen3_config(cfg: ModelConfig, eot_id: int | None = None, pad_id: int | None
         eos_token_id=eot_id,
         pad_token_id=pad_id,
     )
+    # transformers 4.x reads the top-level key and ignores `rope_parameters`,
+    # so without it an older loader would silently use its default theta.
+    hf_cfg.rope_theta = cfg.rope_theta
+    return hf_cfg
 
 
 def to_hf_state_dict(sd: dict[str, torch.Tensor], tie_embeddings: bool) -> dict[str, torch.Tensor]:
@@ -82,7 +87,7 @@ def build_hf_model(cfg: ModelConfig, sd: dict[str, torch.Tensor], **config_kw):
     from transformers import Qwen3ForCausalLM
 
     hf_cfg = qwen3_config(cfg, **config_kw)
-    hf_cfg.torch_dtype = "float32"
+    hf_cfg.dtype = "float32"
     model = Qwen3ForCausalLM(hf_cfg)
     missing, unexpected = model.load_state_dict(
         to_hf_state_dict(sd, cfg.tie_embeddings), strict=False
@@ -146,6 +151,12 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(args.out_dir)
     hf_model.to(getattr(torch, args.dtype)).save_pretrained(out)
     tok.save_pretrained(out)
+    # transformers 5 records its own `TokenizersBackend`, a class 4.x does not
+    # have. Both versions load a tokenizer.json through PreTrainedTokenizerFast.
+    tok_cfg_path = out / "tokenizer_config.json"
+    tok_cfg = json.loads(tok_cfg_path.read_text())
+    tok_cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
+    tok_cfg_path.write_text(json.dumps(tok_cfg, indent=2, ensure_ascii=False) + "\n")
     print(f"saved {out} (step {ckpt['step']}, {args.dtype})")
     return 0
 

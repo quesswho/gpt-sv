@@ -28,6 +28,9 @@ venv/
 *.swp
 *.swo
 
+# lock files
+*.lock
+
 # vim leaves these behind when an open file is unlinked
 .fuse_hidden*
 
@@ -37,3 +40,6 @@ venv/
 
 # exported Hugging Face models
 /hf/
+/.venv-eval/
+
+RUNBOOK.md
